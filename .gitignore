@@ -1,0 +1,9 @@
+# Jarvis — Personalized AI Voice Assistant
+
+# Ignore
+__pycache__/
+*.pyc
+memory.json
+contacts.json
+action_log.txt
+.env

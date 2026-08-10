@@ -1,0 +1,14 @@
+# Jarvis Personal AI — Python Dependencies
+# Install with: pip install -r requirements.txt
+
+speechrecognition>=3.10.0
+pywin32>=306           # Windows SAPI TTS (reliable, never hangs)
+requests>=2.28.0
+colorama>=0.4.6
+pyaudio>=0.2.13
+
+# Action system dependencies
+pycaw>=20181226        # Windows Core Audio -- volume control
+psutil>=5.9.0          # Process listing/killing -- close_app
+pillow>=10.0.0         # PIL.ImageGrab -- take_screenshot
+pyautogui>=0.9.54      # Fallback screenshot if Pillow unavailable

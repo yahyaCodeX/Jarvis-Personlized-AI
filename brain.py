@@ -166,17 +166,10 @@ MIC_DEVICE_INDEX = 1
 
 recognizer = sr.Recognizer()
 
-# Fixed energy threshold — do NOT let the library auto-adjust this.
-# With dynamic=True, the threshold recalibrates while you speak, so when
-# your voice naturally dips at the end of a sentence, it mistakes that
-# drop as silence and cuts the recording short. Fixed=False prevents that.
 recognizer.energy_threshold         = 300
-recognizer.dynamic_energy_threshold = False   # KEY FIX: stops mid-speech recalibration
-
-# How long a pause (seconds) must be before speech_recognition decides
-# you've stopped talking. 0.7 was too tight — trailing words got clipped.
-# 1.3 gives a comfortable natural pause without making Jarvis feel sluggish.
-recognizer.pause_threshold          = 1.3
+recognizer.dynamic_energy_threshold = False
+recognizer.pause_threshold          = 2.0
+recognizer.operation_timeout        = None
 
 # Minimum silence duration (seconds) that counts as non-speech at all.
 # Raised from 0.3 to 0.5 so brief breath pauses inside a sentence don't
@@ -213,11 +206,11 @@ def startup():
     # ── Mic calibration (once at startup) ────────────────────────
     print(f"{Fore.YELLOW}  Calibrating microphone...", end="", flush=True)
     with sr.Microphone(device_index=MIC_DEVICE_INDEX) as source:
-        recognizer.adjust_for_ambient_noise(source, duration=1.5)
+        recognizer.adjust_for_ambient_noise(source, duration=2)
     # Prevent near-zero calibration — enforce a minimum floor
-    if recognizer.energy_threshold < 150:
-        recognizer.energy_threshold = 150
-    print(f"\r{Fore.GREEN}  Microphone calibrated (threshold={recognizer.energy_threshold:.0f}).")
+    if recognizer.energy_threshold < 300:
+        recognizer.energy_threshold = 300
+    print(f"\r{Fore.GREEN}  Microphone listener calibrated (Pause threshold: 2.0s).")
 
     # ── Warm up Ollama ────────────────────────────────────────────
     print(f"{Fore.YELLOW}  ⏳  Warming up AI model ({MODEL})...", end="", flush=True)
@@ -226,7 +219,7 @@ def startup():
             "model":      MODEL,
             "messages":   [{"role": "user", "content": "hi"}],
             "stream":     False,
-            "keep_alive": "30m",   # Keep model in VRAM between requests
+            "keep_alive": -1,   # Keep model in VRAM permanently
             "options":    {"num_predict": 1}
         }, timeout=45)
         r.raise_for_status()
@@ -290,11 +283,11 @@ def ask_jarvis(user_input):
         "model":      MODEL,
         "messages":   messages,
         "stream":     True,
-        "keep_alive": "30m",   # Keep qwen2.5:7b in VRAM — no reload lag
+        "keep_alive": -1,   # Keep model in VRAM permanently
         "options":    {
-            "num_predict":    80,    # Max tokens — keep answers SHORT and fast
-            "num_ctx":        2048,  # Increased to 2048 to accommodate larger prompt + history
-            "temperature":    0.7,
+            "num_predict":    128,   # Caps token length for faster generation
+            "num_ctx":        2048,  # Reduces prompt evaluation latency
+            "temperature":    0.5,   # Focused generation temperature
             "top_p":          0.9,
             "repeat_penalty": 1.1,
         }
@@ -403,7 +396,7 @@ def listen():
     with sr.Microphone(device_index=MIC_DEVICE_INDEX) as source:
         print(f"{Fore.GREEN}Listening...{Style.RESET_ALL}", end="", flush=True)
         try:
-            audio = recognizer.listen(source, timeout=8, phrase_time_limit=15)
+            audio = recognizer.listen(source, timeout=8, phrase_time_limit=20)
         except sr.WaitTimeoutError:
             # No speech detected within the timeout window — stay silent,
             # clear the line, and loop back. This is normal idle behaviour.

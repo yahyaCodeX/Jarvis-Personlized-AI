@@ -12,3 +12,6 @@ pycaw>=20181226        # Windows Core Audio -- volume control
 psutil>=5.9.0          # Process listing/killing -- close_app
 pillow>=10.0.0         # PIL.ImageGrab -- take_screenshot
 pyautogui>=0.9.54      # Fallback screenshot if Pillow unavailable
+pyperclip>=1.8.2       # Clipboard utility -- read clipboard
+python-docx>=0.8.11    # Word Document generation for academic assignments
+selenium>=4.10.0       # Browser automation for MUET attendance login

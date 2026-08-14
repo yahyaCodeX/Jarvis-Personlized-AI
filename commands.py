@@ -14,6 +14,14 @@ import psutil
 import pyautogui
 import pyperclip
 import threading
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import Select
+from webdriver_manager.chrome import ChromeDriverManager
+import time
 
 # Global state for multi-turn assignment generation
 assignment_state = {
@@ -25,6 +33,9 @@ assignment_state = {
 
 # Global tracking variable for the last generated assignment document path
 last_generated_doc = None
+
+# Global tracking variable for the last opened directory folder path
+last_opened_folder = None
 
 # ─── Config ──────────────────────────────────────────────────
 WEATHER_CITY = "Jamshoro, Sindh"
@@ -407,23 +418,20 @@ def empty_recycle_bin():
 
 
 # --- BROWSER AUTOMATION FOR MUET PORTAL ---
-def check_attendance_thread():
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    
+def fetch_ug_attendance():
     try:
-        options = webdriver.EdgeOptions()
+        options = webdriver.ChromeOptions()
         options.add_experimental_option("detach", True)
         options.add_argument("--disable-gpu")
         options.add_argument("--log-level=3")
         options.add_argument("--silent")
         
-        driver = webdriver.Edge(options=options)
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
         driver.get("http://misportal.muet.edu.pk/mis/login.php")
         
-        wait = WebDriverWait(driver, 10)
+        wait = WebDriverWait(driver, 15)
+        
+        # a) Login logic
         cnic_input = wait.until(EC.presence_of_element_located((By.ID, "inputStudentCNIC")))
         password_input = driver.find_element(By.ID, "inputStudentPassword")
         submit_btn = driver.find_element(By.ID, "studentLogin")
@@ -433,12 +441,68 @@ def check_attendance_thread():
         password_input.clear()
         password_input.send_keys("yahyamis@01")
         submit_btn.click()
+        
+        # b) Locate the sidebar menu item "Provisional Report" and click it
+        provisional_report_link = wait.until(
+            EC.element_to_be_clickable((By.XPATH, "//a[contains(., 'Provisional Report')]"))
+        )
+        provisional_report_link.click()
+        
+        # c) Locate the submenu item "1. Under Graduate" and click it
+        under_graduate_link = wait.until(
+            EC.element_to_be_clickable((By.XPATH, "//a[contains(., '1. Under Graduate')]"))
+        )
+        under_graduate_link.click()
+        
+        # d) Locate first dropdown (Department) using tag name, wrap in Select() and select
+        select_elements = wait.until(
+            EC.presence_of_all_elements_located((By.TAG_NAME, "select"))
+        )
+        if len(select_elements) >= 1:
+            dept_select = Select(select_elements[0])
+            # Fallback to JavaScript if Select() fails to interact with a hidden element
+            try:
+                dept_select.select_by_visible_text("Computer Systems Engineering")
+            except:
+                driver.execute_script("""
+                    var sel = arguments[0];
+                    for(var i=0; i<sel.options.length; i++){
+                        if(sel.options[i].text.includes('Computer Systems Engineering')){
+                            sel.value = sel.options[i].value;
+                            break;
+                        }
+                    }
+                    sel.dispatchEvent(new Event('input', { bubbles: true }));
+                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                    if (typeof jQuery !== 'undefined') { jQuery(sel).trigger('change'); }
+                """, select_elements[0])
+        
+        # e) AJAX delay
+        time.sleep(2)
+        
+        # f) Locate second dropdown (Semester), wrap in Select() and select
+        select_elements = driver.find_elements(By.TAG_NAME, "select")
+        if len(select_elements) >= 2:
+            sem_select = Select(select_elements[1])
+            try:
+                sem_select.select_by_visible_text("Class 22CS-I - Semester 8")
+            except:
+                driver.execute_script("""
+                    var sel = arguments[0];
+                    for(var i=0; i<sel.options.length; i++){
+                        if(sel.options[i].text.includes('Semester 8')){
+                            sel.value = sel.options[i].value;
+                            break;
+                        }
+                    }
+                    sel.dispatchEvent(new Event('input', { bubbles: true }));
+                    sel.dispatchEvent(new Event('change', { bubbles: true }));
+                    if (typeof jQuery !== 'undefined') { jQuery(sel).trigger('change'); }
+                """, select_elements[1])
+        return "I have successfully logged into the MIS portal and loaded your 8th-semester attendance, sir."
     except Exception as e:
-        try:
-            from brain import speak
-            speak(f"Sir, I encountered an issue logging into the attendance portal: {e}")
-        except Exception:
-            pass
+        print(f"--- SELENIUM ERROR ---\n{str(e)}\n-----------------------")
+        return "I encountered an error navigating the MIS portal."
 
 
 def process_fast_command(text):
@@ -541,9 +605,628 @@ def process_fast_command(text):
         return take_screenshot()
     elif "empty recycle bin" in text_clean:
         return empty_recycle_bin()
-    elif "attendance" in text_clean or "attendence" in text_clean:
-        threading.Thread(target=check_attendance_thread, daemon=True).start()
-        return "Opening the Mehran University attendance portal and logging you in now, sir."
+    elif any(p in text_clean for p in ["check my attendance", "show my attendance", "open mis portal", "attendance", "attendence"]):
+        return fetch_ug_attendance()
 
     # Returning None tells brain.py to forward the prompt to Qwen/Ollama
     return None
+
+
+# ─── Gemini Live Assistant Tools ─────────────────────────────
+
+def check_attendance() -> str:
+    """Checks and displays university class attendance from the MIS portal using Selenium."""
+    return fetch_ug_attendance()
+
+
+def generate_assignment(topic: str, subject: str) -> str:
+    """Generates an academic university assignment Word document on a background thread using local Ollama."""
+    threading.Thread(
+        target=generate_assignment_thread,
+        args=(topic, subject),
+        daemon=True
+    ).start()
+    return f"I am now generating the assignment on {topic} for the subject {subject} in the background, sir."
+
+
+def open_last_assignment() -> str:
+    """Opens the last generated assignment document in Microsoft Word."""
+    global last_generated_doc
+    if last_generated_doc and os.path.exists(last_generated_doc):
+        try:
+            os.startfile(last_generated_doc)
+            return "Opening your assignment document now, sir."
+        except Exception as e:
+            return f"Failed to open the document: {e}"
+    else:
+        # Fallback check for any recent .docx on Desktop
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        if os.path.exists(desktop):
+            docx_files = [os.path.join(desktop, f) for f in os.listdir(desktop) if f.endswith("_Assignment.docx")]
+            if docx_files:
+                latest_file = max(docx_files, key=os.path.getctime)
+                try:
+                    os.startfile(latest_file)
+                    last_generated_doc = latest_file
+                    return "Opening your most recent assignment from the desktop, sir."
+                except Exception as e:
+                    return f"Failed to open the document: {e}"
+        return "I could not find any recently generated assignment document, sir."
+
+
+def ask_local_qwen(prompt: str) -> str:
+    """Queries the local Ollama Qwen model synchronously and returns the response."""
+    import json
+    ollama_url = "http://localhost:11434/api/generate"
+    payload = {
+        "model": "qwen",
+        "prompt": prompt,
+        "stream": False
+    }
+    try:
+        response = requests.post(ollama_url, json=payload, timeout=60)
+        response.raise_for_status()
+        res_json = response.json()
+        return res_json.get("response", "").strip()
+    except Exception as e:
+        return f"Error contacting local Qwen model: {e}"
+
+
+def open_application(app_name: str) -> str:
+    """Opens a common application (notepad, calculator, chrome, explorer, cmd) or a custom URL/path."""
+    global last_opened_folder
+    
+    # Clean the path from surrounding quotes
+    path_clean = app_name.strip(' "\'')
+    
+    # Normalize drive letters (e.g., "e:" -> "E:\", "E:" -> "E:\")
+    if len(path_clean) == 2 and path_clean[1] == ":":
+        path_clean = path_clean.upper() + "\\"
+        
+    name_clean = path_clean.lower()
+    
+    # Resolve common folder aliases
+    common_folders = {
+        "pictures": os.path.join(os.path.expanduser("~"), "Pictures"),
+        "downloads": os.path.join(os.path.expanduser("~"), "Downloads"),
+        "documents": os.path.join(os.path.expanduser("~"), "Documents"),
+        "desktop": os.path.join(os.path.expanduser("~"), "Desktop"),
+        "videos": os.path.join(os.path.expanduser("~"), "Videos"),
+        "music": os.path.join(os.path.expanduser("~"), "Music")
+    }
+    
+    for alias, folder_path in common_folders.items():
+        if name_clean == alias or name_clean == f"{alias} folder":
+            path_clean = folder_path
+            name_clean = folder_path.lower()
+            last_opened_folder = folder_path
+            break
+
+    # Track directory paths if opening a folder
+    if os.path.isdir(path_clean):
+        last_opened_folder = os.path.abspath(path_clean)
+    
+    # Check if it's a URL
+    if name_clean.startswith("http://") or name_clean.startswith("https://") or re.match(r'^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}', name_clean):
+        url = name_clean if name_clean.startswith("http") else f"https://{name_clean}"
+        webbrowser.open(url)
+        return f"Opening URL: {url}, sir."
+        
+    # Check in _APPS dict
+    for app_key, cmd in _APPS.items():
+        if app_key in name_clean:
+            try:
+                # If opening file explorer via alias, we can track default explorer directory
+                if app_key == "explorer":
+                    last_opened_folder = os.path.expanduser("~")
+                os.system(cmd)
+                return f"Opening {app_key} for you, sir."
+            except Exception as e:
+                return f"Failed to open {app_key}: {e}"
+                
+    # Fallback to direct start
+    try:
+        os.startfile(path_clean)
+        return f"Opening {path_clean}, sir."
+    except Exception:
+        try:
+            subprocess.Popen([path_clean], shell=True)
+            return f"Launching {path_clean}, sir."
+        except Exception as e2:
+            return f"Could not launch or find application '{app_name}': {e2}"
+
+
+def close_application(app_name: str) -> str:
+    """Safely closes a running application or process."""
+    name_clean = app_name.lower().strip()
+    
+    # Strict blocklist to protect critical Windows system processes
+    blocklist = ['explorer.exe', 'csrss.exe', 'svchost.exe', 'winlogon.exe']
+    
+    # Map common keys to process names
+    app_mapping = {
+        "chrome": "chrome.exe",
+        "browser": "chrome.exe",
+        "notepad": "notepad.exe",
+        "calculator": "CalculatorApp.exe",
+        "calc": "CalculatorApp.exe",
+        "paint": "mspaint.exe",
+        "vs code": "Code.exe",
+        "vscode": "Code.exe",
+        "explorer": "explorer.exe",
+        "file explorer": "explorer.exe",
+        "cmd": "cmd.exe",
+        "terminal": "cmd.exe",
+        "spotify": "Spotify.exe",
+        "word": "WINWORD.EXE",
+        "excel": "EXCEL.EXE",
+        "powerpoint": "POWERPNT.EXE",
+        "ppt": "POWERPNT.EXE"
+    }
+    
+    exe_name = app_mapping.get(name_clean, app_name)
+    if not exe_name.endswith(".exe") and not exe_name.endswith(".EXE"):
+        exe_name += ".exe"
+        
+    # Check if the process matches any critical blocklist item
+    if exe_name.lower() in blocklist:
+        if exe_name.lower() == "explorer.exe":
+            # Gracefully close File Explorer windows instead of killing explorer.exe
+            try:
+                import win32com.client
+                shell = win32com.client.Dispatch("Shell.Application")
+                windows = shell.Windows()
+                closed_count = 0
+                for window in list(windows):
+                    if "explorer.exe" in getattr(window, "FullName", "").lower():
+                        window.Quit()
+                        closed_count += 1
+                if closed_count > 0:
+                    return f"Gracefully closed {closed_count} File Explorer window(s), preserving the system shell, sir."
+                else:
+                    return "No File Explorer windows were open to close, sir."
+            except Exception as e:
+                return f"Failed to gracefully close File Explorer windows: {e}"
+        else:
+            return f"[WARNING] Terminating critical system process '{exe_name}' is blocked to protect system stability, sir."
+            
+    try:
+        result = subprocess.run(f"taskkill /f /im {exe_name}", capture_output=True, text=True, shell=True)
+        if result.returncode == 0:
+            return f"Closed {app_name} successfully, sir."
+        else:
+            return f"Could not close {app_name}. (taskkill message: {result.stderr.strip()})"
+    except Exception as e:
+        return f"Failed to close application {app_name}: {e}"
+
+
+def system_control(action: str) -> str:
+    """Controls OS features like volume, lock screen, or taking screenshots."""
+    act_clean = action.lower().strip()
+    
+    if "volume_up" in act_clean:
+        try:
+            # VK_VOLUME_UP (0xAF) code sent 5 times
+            for _ in range(5):
+                ctypes.windll.user32.keybd_event(0xAF, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0xAF, 0, 2, 0)
+            return "Volume increased, sir."
+        except Exception as e:
+            return f"Failed to increase volume: {e}"
+            
+    elif "volume_down" in act_clean:
+        try:
+            # VK_VOLUME_DOWN (0xAE) code sent 5 times
+            for _ in range(5):
+                ctypes.windll.user32.keybd_event(0xAE, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0xAE, 0, 2, 0)
+            return "Volume decreased, sir."
+        except Exception as e:
+            return f"Failed to decrease volume: {e}"
+            
+    elif "mute" in act_clean:
+        try:
+            # VK_VOLUME_MUTE (0xAD) code
+            ctypes.windll.user32.keybd_event(0xAD, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(0xAD, 0, 2, 0)
+            return "Volume mute state toggled, sir."
+        except Exception as e:
+            return f"Failed to toggle mute state: {e}"
+            
+    elif "screenshot" in act_clean:
+        return take_screenshot()
+        
+    elif "lock" in act_clean:
+        return lock_screen_local()
+        
+    else:
+        return f"Unknown system control action '{action}', sir."
+
+
+def open_website(url_or_query: str) -> str:
+    """Opens any website, URL, or search query directly in the default browser."""
+    target = url_or_query.strip()
+    
+    # Custom alias mapping to bypass voice/safety blocks
+    aliases = {
+        "p-hub": "pornhub.com",
+        "phub": "pornhub.com",
+        "the hub": "pornhub.com",
+        "adult site": "pornhub.com",
+        "xv": "xvideos.com",
+        "x-videos": "xvideos.com",
+        "xn": "xnxx.com"
+    }
+    
+    target_lower = target.lower()
+    for alias, actual in aliases.items():
+        if alias in target_lower:
+            target = actual
+            break
+            
+    if not target.startswith("http://") and not target.startswith("https://"):
+        if "." in target and " " not in target:
+            target = "https://" + target
+        else:
+            import urllib.parse
+            target = f"https://www.google.com/search?q={urllib.parse.quote(target)}"
+    webbrowser.open(target)
+    return f"Opened {target} in browser."
+
+
+def write_to_notepad_async(content: str, title: str = "notes.txt") -> str:
+    """Launches Notepad in a background thread and writes content without blocking."""
+    def _worker():
+        filepath = os.path.join(os.getcwd(), title)
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+        subprocess.Popen(["notepad.exe", filepath])
+    
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
+    return f"Opened Notepad and wrote {len(content)} characters to {title} in the background."
+
+
+def shutdown_assistant() -> str:
+    """Terminates the Jarvis assistant application cleanly."""
+    print("\n👋 Shutting down Jarvis... Goodbye, sir.")
+    try:
+        import win32com.client
+        speaker = win32com.client.Dispatch("SAPI.SpVoice")
+        speaker.Speak("Goodbye, sir. Shutting down now.")
+    except Exception:
+        pass
+    os._exit(0)
+
+
+def page_scroll(direction: str) -> str:
+    """Scrolls the active window or browser page up or down."""
+    dir_clean = direction.lower().strip()
+    try:
+        import pyautogui
+        if "down" in dir_clean:
+            pyautogui.press("pagedown")
+            return "Scrolled down, sir."
+        elif "up" in dir_clean:
+            pyautogui.press("pageup")
+            return "Scrolled up, sir."
+        else:
+            return f"Unknown scroll direction '{direction}', sir."
+    except Exception as e:
+        return f"Failed to scroll page: {e}"
+
+
+def type_and_search(text: str) -> str:
+    """Types text on the active input field and presses enter to execute a search."""
+    try:
+        import pyautogui
+        import time
+        pyautogui.write(text)
+        time.sleep(0.2)
+        pyautogui.press("enter")
+        return f"Typed '{text}' and executed search, sir."
+    except Exception as e:
+        return f"Failed to type and search: {e}"
+
+
+# Stateful YouTube automation variables
+youtube_driver = None
+latest_youtube_results = []
+
+
+def search_youtube(query: str) -> str:
+    """Searches YouTube using Selenium and stores the video results for playback."""
+    global youtube_driver, latest_youtube_results
+    try:
+        # Close any existing driver if active
+        if youtube_driver is not None:
+            try:
+                youtube_driver.quit()
+            except Exception:
+                pass
+            youtube_driver = None
+            
+        latest_youtube_results = []
+        
+        # Initialize Selenium Chrome driver
+        options = webdriver.ChromeOptions()
+        options.add_experimental_option("detach", True)
+        options.add_argument("--disable-gpu")
+        options.add_argument("--log-level=3")
+        options.add_argument("--silent")
+        
+        # Launch browser
+        youtube_driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+        url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
+        youtube_driver.get(url)
+        
+        # Wait for video renderer elements to load
+        wait = WebDriverWait(youtube_driver, 15)
+        video_elements = wait.until(
+            EC.presence_of_all_elements_located((By.XPATH, "//a[@id='video-title']"))
+        )
+        
+        # Store elements and titles
+        latest_youtube_results = []
+        titles_preview = []
+        for index, elem in enumerate(video_elements):
+            title = elem.get_attribute("title")
+            href = elem.get_attribute("href")
+            # Filter out non-video or empty elements
+            if title and href and "/watch" in href:
+                latest_youtube_results.append({
+                    "element": elem,
+                    "title": title,
+                    "href": href
+                })
+                if len(latest_youtube_results) <= 5:
+                    titles_preview.append(f"#{len(latest_youtube_results)}: {title}")
+                if len(latest_youtube_results) >= 10:
+                    break
+                    
+        preview_str = "\n".join(titles_preview)
+        print(f"[YOUTUBE SEARCH] Top Results:\n{preview_str}")
+        return "Search complete. Ready to play."
+    except Exception as e:
+        # Fallback to web browser search if Selenium fails
+        try:
+            url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}"
+            webbrowser.open(url)
+            return f"Opened YouTube search for '{query}' in default browser due to automation error: {e}"
+        except Exception as e2:
+            return f"Failed to search YouTube: {e} | {e2}"
+
+
+def play_youtube_video(index: int = 1) -> str:
+    """Plays a YouTube video by 1-based index from the latest search results."""
+    global youtube_driver, latest_youtube_results
+    if not youtube_driver:
+        return "No active YouTube search session found. Please search first, sir."
+        
+    if not latest_youtube_results:
+        return "No YouTube search results available to play, sir."
+        
+    # Adjust 1-based index to 0-based index
+    actual_index = index - 1 if index > 0 else 0
+    
+    if actual_index < 0 or actual_index >= len(latest_youtube_results):
+        return f"Index {index} is out of range. I found {len(latest_youtube_results)} videos, sir."
+        
+    video = latest_youtube_results[actual_index]
+    video_title = video["title"]
+    video_href = video["href"]
+    
+    try:
+        # Navigate the active driver directly to the video URL for instant playback
+        youtube_driver.get(video_href)
+        return f"Playing video: '{video_title}', sir."
+    except Exception as e:
+        # Fallback to default browser
+        try:
+            webbrowser.open(video_href)
+            return f"Playing '{video_title}' in default browser due to automation error: {e}"
+        except Exception as e2:
+            return f"Failed to play video: {e} | {e2}"
+
+
+def open_file_by_name(filename: str, parent_dir: str = "") -> str:
+    """Locates and opens a file (image, video, document) by name in the specified or last opened folder."""
+    global last_opened_folder
+    
+    file_clean = filename.lower().strip()
+    
+    # 1. Determine directories to scan
+    search_dirs = []
+    if parent_dir and os.path.isdir(parent_dir):
+        search_dirs.append(os.path.abspath(parent_dir))
+    
+    if last_opened_folder and os.path.isdir(last_opened_folder):
+        search_dirs.append(last_opened_folder)
+        
+    # Standard user folders fallback
+    home_dir = os.path.expanduser("~")
+    common_dirs = [
+        os.path.join(home_dir, "Desktop"),
+        os.path.join(home_dir, "Downloads"),
+        os.path.join(home_dir, "Documents"),
+        os.path.join(home_dir, "Pictures"),
+        os.path.join(home_dir, "Videos")
+    ]
+    for d in common_dirs:
+        if os.path.isdir(d) and d not in search_dirs:
+            search_dirs.append(d)
+            
+    # 2. Search for the file in the designated directories (and their immediate subdirectories)
+    matched_file = None
+    for directory in search_dirs:
+        try:
+            # First, check files in the main directory
+            for item in os.listdir(directory):
+                item_path = os.path.join(directory, item)
+                if os.path.isfile(item_path):
+                    item_name_lower = item.lower()
+                    if file_clean in item_name_lower:
+                        matched_file = item_path
+                        break
+            if matched_file:
+                break
+                
+            # Second, check files in immediate subdirectories (1 level deep)
+            for item in os.listdir(directory):
+                sub_path = os.path.join(directory, item)
+                if os.path.isdir(sub_path):
+                    try:
+                        for sub_item in os.listdir(sub_path):
+                            file_path = os.path.join(sub_path, sub_item)
+                            if os.path.isfile(file_path):
+                                if file_clean in sub_item.lower():
+                                    matched_file = file_path
+                                    break
+                    except Exception:
+                        continue
+                if matched_file:
+                    break
+        except Exception:
+            continue
+        if matched_file:
+            break
+            
+    # 3. Open the file if found
+    if matched_file:
+        try:
+            os.startfile(matched_file)
+            return f"Opening '{os.path.basename(matched_file)}' from '{os.path.dirname(matched_file)}', sir."
+        except Exception as e:
+            return f"Found file at '{matched_file}' but failed to open it: {e}"
+            
+    return f"Could not find any file matching '{filename}' in the recently opened folder or system folders, sir."
+
+
+def change_brightness(action: str, value: int = 10) -> str:
+    """Natively gets or sets screen brightness using PowerShell/WMI queries."""
+    act_clean = action.lower().strip()
+    try:
+        if act_clean in ["increase", "up", "raise"]:
+            # Query current brightness
+            cmd_get = 'powershell -Command "(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness).CurrentBrightness"'
+            res_get = subprocess.run(cmd_get, capture_output=True, text=True, shell=True)
+            curr = 50
+            if res_get.returncode == 0 and res_get.stdout.strip():
+                curr = int(res_get.stdout.strip())
+            new_val = min(100, curr + value)
+            cmd_set = f'powershell -Command "Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods | Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{{ Timeout = 0; Brightness = {new_val} }}"'
+            subprocess.run(cmd_set, shell=True)
+            return f"Increased brightness from {curr}% to {new_val}%, sir."
+            
+        elif act_clean in ["decrease", "down", "lower"]:
+            # Query current brightness
+            cmd_get = 'powershell -Command "(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness).CurrentBrightness"'
+            res_get = subprocess.run(cmd_get, capture_output=True, text=True, shell=True)
+            curr = 50
+            if res_get.returncode == 0 and res_get.stdout.strip():
+                curr = int(res_get.stdout.strip())
+            new_val = max(0, curr - value)
+            cmd_set = f'powershell -Command "Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods | Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{{ Timeout = 0; Brightness = {new_val} }}"'
+            subprocess.run(cmd_set, shell=True)
+            return f"Decreased brightness from {curr}% to {new_val}%, sir."
+            
+        elif act_clean in ["set", "to"]:
+            val_clean = min(100, max(0, value))
+            cmd_set = f'powershell -Command "Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods | Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{{ Timeout = 0; Brightness = {val_clean} }}"'
+            subprocess.run(cmd_set, shell=True)
+            return f"Set screen brightness to {val_clean}%, sir."
+            
+        else:
+            return f"Unknown brightness action '{action}', sir."
+    except Exception as e:
+        return f"Failed to adjust screen brightness: {e}"
+
+
+def media_control(action: str) -> str:
+    """Controls system-wide media playback (play, pause, next, previous, stop)."""
+    act_clean = action.lower().strip()
+    try:
+        import win32api
+        import win32con
+        
+        # Virtual key code mapping
+        key_mapping = {
+            "play": win32con.VK_MEDIA_PLAY_PAUSE,
+            "pause": win32con.VK_MEDIA_PLAY_PAUSE,
+            "playpause": win32con.VK_MEDIA_PLAY_PAUSE,
+            "next": win32con.VK_MEDIA_NEXT_TRACK,
+            "prev": win32con.VK_MEDIA_PREV_TRACK,
+            "previous": win32con.VK_MEDIA_PREV_TRACK,
+            "stop": win32con.VK_MEDIA_STOP
+        }
+        
+        if act_clean in key_mapping:
+            vk_code = key_mapping[act_clean]
+            # Send key down
+            win32api.keybd_event(vk_code, 0, 0, 0)
+            # Send key up
+            win32api.keybd_event(vk_code, 0, win32con.KEYEVENTF_KEYUP, 0)
+            return f"Executed media {action} command, sir."
+        else:
+            # Fallback to space key if it's browser-focused play/pause
+            if act_clean in ["play", "pause", "playpause"]:
+                import pyautogui
+                pyautogui.press("space")
+                return "Pressed Spacebar for play/pause, sir."
+            return f"Unknown media action '{action}', sir."
+    except Exception as e:
+        return f"Failed to execute media control: {e}"
+
+
+def switch_browser_tab(direction_or_index: str) -> str:
+    """Switches browser tabs using Ctrl+Tab, Ctrl+Shift+Tab, or Ctrl+Number."""
+    val_clean = direction_or_index.lower().strip()
+    try:
+        import pyautogui
+        if "next" in val_clean or "forward" in val_clean:
+            pyautogui.hotkey("ctrl", "tab")
+            return "Switched to the next tab, sir."
+        elif "prev" in val_clean or "back" in val_clean or "previous" in val_clean:
+            pyautogui.hotkey("ctrl", "shift", "tab")
+            return "Switched to the previous tab, sir."
+        else:
+            # Check if it's a number (tab index)
+            digits = re.findall(r"\d+", val_clean)
+            if digits:
+                idx = int(digits[0])
+                if 1 <= idx <= 9:
+                    pyautogui.hotkey("ctrl", str(idx))
+                    return f"Switched to tab index {idx}, sir."
+            return f"Could not determine tab direction or index from '{direction_or_index}', sir."
+    except Exception as e:
+        return f"Failed to switch browser tab: {e}"
+
+
+def click_screen(x: int = -1, y: int = -1, click_type: str = "single") -> str:
+    """Clicks the mouse on the screen at specified coordinates or current position."""
+    try:
+        import pyautogui
+        pyautogui.FAILSAFE = False
+        
+        click_clean = click_type.lower().strip()
+        
+        # Resolve target position
+        if x >= 0 and y >= 0:
+            pyautogui.moveTo(x, y, duration=0.2)
+            pos_str = f"at coordinates ({x}, {y})"
+        else:
+            pos_str = "at the current mouse position"
+            
+        # Execute click type
+        if "double" in click_clean:
+            pyautogui.doubleClick()
+            return f"Double-clicked {pos_str}, sir."
+        elif "right" in click_clean:
+            pyautogui.rightClick()
+            return f"Right-clicked {pos_str}, sir."
+        else:
+            pyautogui.click()
+            return f"Clicked {pos_str}, sir."
+    except Exception as e:
+        return f"Failed to click screen: {e}"
+

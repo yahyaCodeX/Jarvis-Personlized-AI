@@ -409,34 +409,66 @@ class TestCommands(unittest.TestCase):
         self.assertEqual(res, "Searching for mechanical keyboard on amazon.")
         mock_open_new_tab.assert_called_once_with("https://www.amazon.com/s?k=mechanical%20keyboard")
 
-    @patch('commands.threading.Thread')
-    def test_check_attendance_trigger(self, mock_thread):
-        res = commands.handle_command("check my attendence")
-        self.assertEqual(res, "Opening the Mehran University attendance portal and logging you in now, sir.")
-        mock_thread.assert_called_once()
-        self.assertEqual(mock_thread.call_args[1]['target'], commands.check_attendance_thread)
-
-    @patch('selenium.webdriver.Edge')
-    @patch('brain.speak')
-    def test_check_attendance_thread_success(self, mock_speak, mock_edge):
+    @patch('commands.webdriver.Chrome')
+    @patch('commands.Service')
+    @patch('commands.ChromeDriverManager')
+    def test_check_attendance_trigger_success(self, mock_manager, mock_service, mock_chrome):
         mock_driver = MagicMock()
-        mock_edge.return_value = mock_driver
+        mock_chrome.return_value = mock_driver
         
-        # Mock WebDriverWait and EC element located
-        with patch('selenium.webdriver.support.ui.WebDriverWait.until') as mock_until:
+        with patch('commands.WebDriverWait') as mock_wait_cls, \
+             patch('commands.Select') as mock_select_cls, \
+             patch('commands.time.sleep') as mock_sleep:
+            
+            mock_wait = MagicMock()
+            mock_wait_cls.return_value = mock_wait
+            
+            # Create mocks for elements
             mock_cnic = MagicMock()
-            mock_until.return_value = mock_cnic
+            mock_prov_report = MagicMock()
+            mock_ug = MagicMock()
+            mock_selects = [MagicMock(), MagicMock()]
+            
+            # Each wait.until() call will return these in sequence
+            mock_wait.until.side_effect = [
+                mock_cnic,
+                mock_prov_report,
+                mock_ug,
+                mock_selects
+            ]
+            
+            # find_elements for select tags
+            mock_driver.find_elements.return_value = mock_selects
+            
+            # find_element for inputStudentPassword and studentLogin
             mock_password = MagicMock()
             mock_submit = MagicMock()
-            mock_driver.find_element.side_effect = [mock_password, mock_submit]
+            mock_driver.find_element.side_effect = [
+                mock_password,
+                mock_submit
+            ]
             
-            commands.check_attendance_thread()
+            res = commands.handle_command("check my attendance")
             
-            mock_edge.assert_called_once()
+            self.assertEqual(res, "I have successfully logged into the MIS portal and loaded your 8th-semester attendance, sir.")
+            mock_chrome.assert_called_once()
             mock_driver.get.assert_called_once_with("http://misportal.muet.edu.pk/mis/login.php")
+            mock_cnic.clear.assert_called_once()
             mock_cnic.send_keys.assert_called_once_with("43304-7952345-7")
+            mock_password.clear.assert_called_once()
             mock_password.send_keys.assert_called_once_with("yahyamis@01")
             mock_submit.click.assert_called_once()
+            mock_prov_report.click.assert_called_once()
+            mock_ug.click.assert_called_once()
+
+    @patch('commands.webdriver.Chrome')
+    @patch('commands.Service')
+    @patch('commands.ChromeDriverManager')
+    def test_check_attendance_trigger_failure(self, mock_manager, mock_service, mock_chrome):
+        mock_chrome.side_effect = Exception("Browser failed to start")
+        
+        res = commands.handle_command("check my attendance")
+        self.assertEqual(res, "I encountered an error navigating the MIS portal.")
 
 if __name__ == '__main__':
     unittest.main()

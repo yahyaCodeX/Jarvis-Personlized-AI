@@ -7,3 +7,8 @@ memory.json
 contacts.json
 action_log.txt
 .env
+temp_speech.wav
+tmp_model/
+audio_cache/
+screenshot_*.png
+*.wav

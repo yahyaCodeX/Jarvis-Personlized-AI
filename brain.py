@@ -24,6 +24,7 @@ from memory import (load_memory, save_memory, add_message,
                     get_context_messages, clear_memory, get_stats)
 from commands import handle_command
 from actions import dispatch_action
+from auth.voice_auth import VoiceAuthenticator
 
 colorama_init(autoreset=True)
 
@@ -389,49 +390,42 @@ def ask_jarvis(user_input):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  LISTEN
-# ═══════════════════════════════════════════════════════════════
-def listen():
-    """Capture mic input. No calibration here — done once at startup."""
-    with sr.Microphone(device_index=MIC_DEVICE_INDEX) as source:
-        print(f"{Fore.GREEN}Listening...{Style.RESET_ALL}", end="", flush=True)
-        try:
-            audio = recognizer.listen(source, timeout=8, phrase_time_limit=20)
-        except sr.WaitTimeoutError:
-            # No speech detected within the timeout window — stay silent,
-            # clear the line, and loop back. This is normal idle behaviour.
-            print(f"\r{' '*25}\r", end="", flush=True)
-            return None
-
-    try:
-        text = recognizer.recognize_google(audio)
-        print(f"\r{Fore.WHITE}👂  You: {Fore.YELLOW}{text}{Style.RESET_ALL}   ")
-        return text.lower()
-
-    except sr.UnknownValueError:
-        # Google received audio but couldn't decode speech — usually means
-        # the audio was too quiet, too noisy, or clipped. Ask for a retry
-        # instead of silently returning None (which looks like a freeze).
-        print(f"\r{Fore.YELLOW}🔁  Didn't catch that...{Style.RESET_ALL}   ")
-        speak("Sorry, I didn't catch that — could you repeat?", wait=True)
-        return None
-
-    except sr.RequestError:
-        # Google Speech API is unreachable — likely no internet.
-        print(f"\n{Fore.RED}🌐  Google Speech API unavailable. Check internet.")
-        return None
-
-
-# ═══════════════════════════════════════════════════════════════
 #  MAIN LOOP — Always-listen, no wake word
 # ═══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     startup()
+    
+    authenticator = VoiceAuthenticator()
 
     while True:
-        heard = listen()
+        with sr.Microphone(device_index=MIC_DEVICE_INDEX) as source:
+            print(f"{Fore.GREEN}Listening...{Style.RESET_ALL}", end="", flush=True)
+            try:
+                audio_data = recognizer.listen(source, timeout=8, phrase_time_limit=20)
+            except sr.WaitTimeoutError:
+                # No speech detected within the timeout window
+                print(f"\r{' '*25}\r", end="", flush=True)
+                continue
 
-        if heard is None:
+        # Immediately save and verify biometric
+        with open("temp_speech.wav", "wb") as f:
+            f.write(audio_data.get_wav_data())
+
+        if not authenticator.verify("temp_speech.wav"):
+            speak("Acoustic fingerprint mismatch. Biometric security protocols engaged. Unauthorized input discarded.", wait=True)
+            continue
+
+        # Perform STT
+        try:
+            text = recognizer.recognize_google(audio_data)
+            print(f"\r{Fore.WHITE}👂  You: {Fore.YELLOW}{text}{Style.RESET_ALL}   ")
+            heard = text.lower()
+        except sr.UnknownValueError:
+            print(f"\r{Fore.YELLOW}🔁  Didn't catch that...{Style.RESET_ALL}   ")
+            speak("Sorry, I didn't catch that — could you repeat?", wait=True)
+            continue
+        except sr.RequestError:
+            print(f"\n{Fore.RED}🌐  Google Speech API unavailable. Check internet.")
             continue
 
         # Exit

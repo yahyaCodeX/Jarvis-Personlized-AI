@@ -15,3 +15,13 @@ pyautogui>=0.9.54      # Fallback screenshot if Pillow unavailable
 pyperclip>=1.8.2       # Clipboard utility -- read clipboard
 python-docx>=0.8.11    # Word Document generation for academic assignments
 selenium>=4.10.0       # Browser automation for MUET attendance login
+webdriver-manager>=4.0.0 # WebDriver Manager for Selenium Chrome support
+speechbrain==0.5.16     # Voice biometric speaker recognition library
+torch>=2.0.0            # Deep learning backend for SpeechBrain
+torchaudio>=2.0.0       # Audio loading backend for SpeechBrain
+
+# Gemini Live API dependencies
+google-genai
+python-dotenv
+
+

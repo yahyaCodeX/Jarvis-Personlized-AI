@@ -4,11 +4,14 @@
 __pycache__/
 *.pyc
 memory.json
+jarvis_memory.json
 contacts.json
 action_log.txt
+quick_notes.txt
 .env
 temp_speech.wav
 tmp_model/
 audio_cache/
 screenshot_*.png
 *.wav
+

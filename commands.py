@@ -2,6 +2,7 @@
 # These commands are handled locally — no Ollama call, no wait time.
 
 import datetime
+import json
 import requests
 import os
 import re
@@ -273,15 +274,89 @@ def get_detailed_system_health():
     return f"Drive C has {c_free_gb} GB free. Drive D has {d_free_gb} GB free. Battery is at {battery_status}."
 
 # --- WEB & YOUTUBE ---
+def focus_browser_and_page():
+    """Brings Chrome or default browser window to the foreground and positions cursor over the webpage."""
+    try:
+        import win32gui
+        import win32con
+        import win32api
+        import pyautogui
+        
+        pyautogui.FAILSAFE = False
+        
+        def enum_cb(hwnd, extra):
+            if win32gui.IsWindowVisible(hwnd):
+                title = win32gui.GetWindowText(hwnd).lower()
+                if any(b in title for b in ["chrome", "edge", "firefox", "brave", "opera", "youtube", "google maps"]) or (" - " in title and any(t in title for t in [".com", ".org", "http", "search", "google"])):
+                    extra.append(hwnd)
+        
+        hwnds = []
+        win32gui.EnumWindows(enum_cb, hwnds)
+        
+        if hwnds:
+            hwnd = hwnds[0]
+            win32api.keybd_event(0x12, 0, 0, 0)
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
+            win32api.keybd_event(0x12, 0, win32con.KEYEVENTF_KEYUP, 0)
+            time.sleep(0.15)
+            
+        sw, sh = pyautogui.size()
+        pyautogui.moveTo(sw // 2, sh // 2)
+    except Exception as e:
+        print(f"[FOCUS BROWSER WARNING] {e}")
+
+
+def force_open_browser(url: str) -> bool:
+    """Forces opening a URL on Windows using multiple robust fallback methods."""
+    opened = False
+    try:
+        subprocess.Popen(f'start "" "{url}"', shell=True)
+        opened = True
+    except Exception:
+        pass
+    if not opened:
+        try:
+            chrome_paths = [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                os.path.expanduser(r"~\AppData\Local\Google\Chrome\Application\chrome.exe"),
+            ]
+            for cp in chrome_paths:
+                if os.path.exists(cp):
+                    subprocess.Popen([cp, url])
+                    opened = True
+                    break
+        except Exception:
+            pass
+    if not opened:
+        try:
+            webbrowser.open(url)
+            opened = True
+        except Exception:
+            pass
+            
+    if opened:
+        time.sleep(0.5)
+        focus_browser_and_page()
+    return opened
+
 def play_on_youtube(query):
-    encoded_query = urllib.parse.quote(query)
-    webbrowser.open(f"https://www.youtube.com/results?search_query={encoded_query}")
-    return f"Searching YouTube for {query}."
+    try:
+        import pywhatkit
+        pywhatkit.playonyt(query)
+        return f"Playing '{query}' on YouTube now, sir."
+    except Exception:
+        encoded_query = urllib.parse.quote(query)
+        target = f"https://www.youtube.com/results?search_query={encoded_query}"
+        force_open_browser(target)
+        return f"Searching YouTube for {query}, sir."
 
 def search_google(query):
     encoded_query = urllib.parse.quote(query)
-    webbrowser.open(f"https://www.google.com/search?q={encoded_query}")
-    return f"Searching Google for {query}."
+    target = f"https://www.google.com/search?q={encoded_query}"
+    force_open_browser(target)
+    return f"Searching Google for {query}, sir."
 
 def open_in_new_tab(query_or_url):
     query_or_url = query_or_url.strip()
@@ -418,7 +493,23 @@ def empty_recycle_bin():
 
 
 # --- BROWSER AUTOMATION FOR MUET PORTAL ---
+_last_attendance_time = 0
+_attendance_cache_result = None
+_attendance_cache_timestamp = 0
+
 def fetch_ug_attendance():
+    global _last_attendance_time, _attendance_cache_result, _attendance_cache_timestamp
+    now = time.time()
+
+    # 15-minute (900 seconds) in-memory cache check for millisecond response time
+    if _attendance_cache_result and (now - _attendance_cache_timestamp < 900):
+        print("[ATTENDANCE CACHE HIT] Returning cached MIS attendance in milliseconds.")
+        return _attendance_cache_result
+
+    if now - _last_attendance_time < 15.0:
+        return "I am already logging into the MIS portal for your attendance, sir."
+    _last_attendance_time = now
+
     try:
         options = webdriver.ChromeOptions()
         options.add_experimental_option("detach", True)
@@ -460,7 +551,6 @@ def fetch_ug_attendance():
         )
         if len(select_elements) >= 1:
             dept_select = Select(select_elements[0])
-            # Fallback to JavaScript if Select() fails to interact with a hidden element
             try:
                 dept_select.select_by_visible_text("Computer Systems Engineering")
             except:
@@ -499,10 +589,141 @@ def fetch_ug_attendance():
                     sel.dispatchEvent(new Event('change', { bubbles: true }));
                     if (typeof jQuery !== 'undefined') { jQuery(sel).trigger('change'); }
                 """, select_elements[1])
-        return "I have successfully logged into the MIS portal and loaded your 8th-semester attendance, sir."
+                
+        result_msg = "I have successfully logged into the MIS portal and loaded your 8th-semester attendance, sir."
+        _attendance_cache_result = result_msg
+        _attendance_cache_timestamp = now
+        return result_msg
     except Exception as e:
         print(f"--- SELENIUM ERROR ---\n{str(e)}\n-----------------------")
         return "I encountered an error navigating the MIS portal."
+
+
+# ─── REFINED AUTOMATION & SYSTEM TOOLS ───────────────────────
+
+def youtube_control(action: str, query: str = None, video_index: int = 1) -> str:
+    """Manages YouTube search, video selection, and direct playback."""
+    action = (action or "search").lower().strip()
+    
+    if action == "search":
+        if not query:
+            return "Please specify a search query for YouTube, sir."
+        encoded = urllib.parse.quote(query)
+        webbrowser.open(f"https://www.youtube.com/results?search_query={encoded}")
+        return f"Searching YouTube for '{query}', sir."
+        
+    elif action == "select_video":
+        tab_count = 4 + max(0, (video_index - 1))
+        time.sleep(0.5)
+        for _ in range(tab_count):
+            pyautogui.press('tab')
+            time.sleep(0.08)
+        pyautogui.press('enter')
+        return f"Selected video #{video_index} on YouTube, sir."
+        
+    elif action == "play_direct":
+        if not query:
+            return "Please specify a video or song to play, sir."
+        try:
+            import pywhatkit
+            pywhatkit.playonyt(query)
+        except Exception:
+            encoded = urllib.parse.quote(query)
+            webbrowser.open(f"https://www.youtube.com/results?search_query={encoded}")
+        return f"Playing '{query}' on YouTube, sir."
+        
+    else:
+        return f"Unknown YouTube action '{action}', sir."
+
+
+def web_search_and_navigate(action: str, query: str = None, result_index: int = 1) -> str:
+    """Performs Google search or opens specific search results immediately."""
+    action = (action or "google_search").lower().strip()
+    
+    if action == "google_search":
+        if not query:
+            return "Please specify a search query, sir."
+        encoded = urllib.parse.quote(query)
+        webbrowser.open(f"https://www.google.com/search?q={encoded}")
+        return f"Searching Google for '{query}', sir."
+        
+    elif action == "open_result":
+        if not query:
+            time.sleep(0.5)
+            tab_count = 14 + max(0, (result_index - 1) * 2)
+            for _ in range(tab_count):
+                pyautogui.press('tab')
+                time.sleep(0.08)
+            pyautogui.press('enter')
+            return f"Opened search result #{result_index}, sir."
+        else:
+            encoded = urllib.parse.quote(query)
+            webbrowser.open(f"https://www.google.com/search?q={encoded}&btnI=1")
+            return f"Opened top search result for '{query}', sir."
+            
+    else:
+        return f"Unknown search action '{action}', sir."
+
+
+def browser_viewport_control(action: str, value: int = 500) -> str:
+    """Controls browser scrolling and tab management."""
+    action = (action or "").lower().strip()
+    try:
+        val = int(value) if value is not None else 500
+    except (ValueError, TypeError):
+        val = 500
+    
+    if action == "scroll_down":
+        pyautogui.scroll(-val)
+        return f"Scrolled down by {val} units, sir."
+    elif action == "scroll_up":
+        pyautogui.scroll(val)
+        return f"Scrolled up by {val} units, sir."
+    elif action == "next_tab":
+        pyautogui.hotkey('ctrl', 'tab')
+        return "Switched to next tab, sir."
+    elif action == "prev_tab":
+        pyautogui.hotkey('ctrl', 'shift', 'tab')
+        return "Switched to previous tab, sir."
+    elif action == "close_tab":
+        pyautogui.hotkey('ctrl', 'w')
+        return "Closed active tab, sir."
+    elif action == "select_tab":
+        tab_num = min(9, max(1, val))
+        pyautogui.hotkey('ctrl', str(tab_num))
+        return f"Selected tab #{tab_num}, sir."
+    else:
+        return f"Unknown viewport action '{action}', sir."
+
+
+def create_folder(folder_name: str, location: str = "Desktop") -> str:
+    """Creates a directory at Desktop, Downloads, Documents, Projects (D:\\Development), or a custom path."""
+    if not folder_name:
+        return "Folder name is required, sir."
+        
+    user_home = os.path.expanduser("~")
+    location_clean = (location or "Desktop").strip()
+    loc_lower = location_clean.lower()
+    
+    if loc_lower == "desktop":
+        base_dir = os.path.join(user_home, "Desktop")
+    elif loc_lower == "downloads":
+        base_dir = os.path.join(user_home, "Downloads")
+    elif loc_lower == "documents":
+        base_dir = os.path.join(user_home, "Documents")
+    elif loc_lower in ["projects", "development", "dev"]:
+        base_dir = r"D:\Development" if os.path.exists(r"D:\Development") else os.path.join(user_home, "Projects")
+    elif os.path.isabs(location_clean):
+        base_dir = location_clean
+    else:
+        base_dir = os.path.join(user_home, location_clean)
+        
+    target_path = os.path.join(base_dir, folder_name)
+    try:
+        os.makedirs(target_path, exist_ok=True)
+        return f"Folder '{folder_name}' created successfully at {target_path}, sir."
+    except Exception as e:
+        return f"Failed to create folder '{folder_name}': {e}"
 
 
 def process_fast_command(text):
@@ -870,8 +1091,8 @@ def open_website(url_or_query: str) -> str:
         else:
             import urllib.parse
             target = f"https://www.google.com/search?q={urllib.parse.quote(target)}"
-    webbrowser.open(target)
-    return f"Opened {target} in browser."
+    force_open_browser(target)
+    return f"Opened {target} in browser, sir."
 
 
 def write_to_notepad_async(content: str, title: str = "notes.txt") -> str:
@@ -899,21 +1120,47 @@ def shutdown_assistant() -> str:
     os._exit(0)
 
 
-def page_scroll(direction: str) -> str:
-    """Scrolls the active window or browser page up or down."""
+def page_scroll(direction: str, amount: int = 500) -> str:
+    """Scrolls the active window or browser page up or down using native Windows mouse wheel events."""
     dir_clean = direction.lower().strip()
     try:
         import pyautogui
-        if "down" in dir_clean:
-            pyautogui.press("pagedown")
-            return "Scrolled down, sir."
-        elif "up" in dir_clean:
+        import win32api
+        import win32con
+        import time
+        
+        pyautogui.FAILSAFE = False
+        
+        # 1. Bring browser window to front and position mouse at screen center (no click)
+        focus_browser_and_page()
+        time.sleep(0.1)
+        
+        amt = abs(int(amount)) if amount else 500
+        notches = max(1, min(20, amt // 100))
+        
+        if "up" in dir_clean:
+            wheel_delta = 120 * notches
+            # Native Windows mouse wheel event
+            win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, wheel_delta, 0)
+            # PyAutoGUI wheel event
+            pyautogui.scroll(amt)
+            # Keyboard PageUp fallback
             pyautogui.press("pageup")
-            return "Scrolled up, sir."
+            return f"Scrolled up by {amt} units, sir."
+        elif "down" in dir_clean:
+            wheel_delta = -120 * notches
+            # Native Windows mouse wheel event
+            win32api.mouse_event(win32con.MOUSEEVENTF_WHEEL, 0, 0, wheel_delta, 0)
+            # PyAutoGUI wheel event
+            pyautogui.scroll(-amt)
+            # Keyboard PageDown fallback
+            pyautogui.press("pagedown")
+            return f"Scrolled down by {amt} units, sir."
         else:
             return f"Unknown scroll direction '{direction}', sir."
     except Exception as e:
         return f"Failed to scroll page: {e}"
+
 
 
 def type_and_search(text: str) -> str:
@@ -1229,4 +1476,138 @@ def click_screen(x: int = -1, y: int = -1, click_type: str = "single") -> str:
             return f"Clicked {pos_str}, sir."
     except Exception as e:
         return f"Failed to click screen: {e}"
+
+
+def browser_tab_control(action: str, tab_index: int = None) -> str:
+    """Manages browser tabs using pyautogui hotkeys."""
+    act_clean = action.lower().strip()
+    try:
+        import pyautogui
+        import time
+        
+        focus_browser_and_page()
+        time.sleep(0.15)
+        
+        if act_clean in ["next_tab", "next"]:
+            pyautogui.hotkey("ctrl", "tab")
+            return "Switched to the next tab, sir."
+        elif act_clean in ["prev_tab", "prev", "previous_tab", "previous"]:
+            pyautogui.hotkey("ctrl", "shift", "tab")
+            return "Switched to the previous tab, sir."
+        elif act_clean in ["close_tab", "close"]:
+            pyautogui.hotkey("ctrl", "w")
+            return "Closed current tab, sir."
+        elif act_clean in ["select_tab", "select"] and tab_index is not None:
+            pyautogui.hotkey("ctrl", str(tab_index))
+            return f"Switched to tab index {tab_index}, sir."
+        else:
+            return f"Unknown or incomplete browser tab action '{action}', sir."
+    except Exception as e:
+        return f"Failed to control browser tab: {e}"
+
+
+def site_interaction(action: str, query: str = None) -> str:
+    """Interacts with current web page using keyboard shortcuts via pyautogui."""
+    act_clean = action.lower().strip()
+    try:
+        import pyautogui
+        import time
+        
+        focus_browser_and_page()
+        time.sleep(0.15)
+        
+        if act_clean == "youtube_search":
+            pyautogui.press("/")
+            time.sleep(0.5)
+            if query:
+                pyautogui.hotkey("ctrl", "a")
+                pyautogui.write(query)
+                pyautogui.press("enter")
+                return f"Searched YouTube for '{query}', sir."
+            return "Activated YouTube search box, sir."
+        elif act_clean == "youtube_select_video":
+            count = 1
+            if query:
+                try:
+                    count = int(query)
+                except ValueError:
+                    digits = re.findall(r"\d+", query)
+                    if digits:
+                        count = int(digits[0])
+            for _ in range(count):
+                pyautogui.press("tab")
+                time.sleep(0.1)
+            pyautogui.press("enter")
+            return f"Selected YouTube video #{count}, sir."
+        elif act_clean == "page_search":
+            pyautogui.hotkey("ctrl", "f")
+            time.sleep(0.3)
+            if query:
+                pyautogui.write(query)
+                pyautogui.press("enter")
+                return f"Searched page for '{query}', sir."
+            return "Opened page search box, sir."
+        else:
+            return f"Unknown site interaction action '{action}', sir."
+    except Exception as e:
+        return f"Failed to perform site interaction: {e}"
+
+
+def search_maps(query: str) -> str:
+    """Launches Google Maps search in the default browser."""
+    try:
+        encoded_query = urllib.parse.quote(query)
+        url = f"https://www.google.com/maps/search/?api=1&query={encoded_query}"
+        force_open_browser(url)
+        return f"Opened Google Maps search for '{query}', sir."
+    except Exception as e:
+        return f"Failed to search Google Maps: {e}"
+
+
+# ─── MEMORY & IDENTITY ────────────────────────────────────────
+MEMORY_FILE = "jarvis_memory.json"
+
+
+def remember_fact(fact: str) -> str:
+    """Appends a new fact to the permanent JSON memory file."""
+    fact_clean = fact.strip()
+    if not fact_clean:
+        return "Fact cannot be empty, sir."
+        
+    memories = []
+    if os.path.exists(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+                memories = json.load(f)
+                if not isinstance(memories, list):
+                    memories = []
+        except Exception:
+            memories = []
+            
+    memories.append(fact_clean)
+    
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(memories, f, indent=2)
+        return f"Remembered: '{fact_clean}', sir."
+    except Exception as e:
+        return f"Failed to save memory: {e}"
+
+
+def get_all_memories() -> str:
+    """Reads saved facts from the permanent JSON memory file and returns them formatted."""
+    if not os.path.exists(MEMORY_FILE):
+        return "No previous memories."
+        
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            memories = json.load(f)
+            if isinstance(memories, list) and memories:
+                formatted = "\n".join([f"- {m}" for m in memories])
+                return formatted
+            return "No previous memories."
+    except Exception:
+        return "No previous memories."
+
+
 

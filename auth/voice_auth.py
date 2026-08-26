@@ -84,9 +84,10 @@ except ImportError:
     from speechbrain.inference.speaker import SpeakerRecognition
 
 class VoiceAuthenticator:
-    def __init__(self):
+    def __init__(self, threshold: float = 0.40):
         # Suppress logging during model loading
         logging.getLogger("speechbrain").setLevel(logging.ERROR)
+        self.threshold = threshold
         model_dir = os.path.join(os.path.dirname(__file__), "..", "tmp_model")
         self.verifier = SpeakerRecognition.from_hparams(
             source="speechbrain/spkrec-ecapa-voxceleb",
@@ -107,12 +108,50 @@ class VoiceAuthenticator:
 
         try:
             score, prediction = self.verifier.verify_files(baseline_path, test_audio_path)
-            # Threshold of 0.40 is optimal to prevent false negatives from microphone/room acoustic variation,
-            # while still easily blocking unauthorized speakers (who score below 0.15).
-            threshold = 0.40
-            print(f"\n[BIOMETRIC] Similarity Score: {score.item():.4f} (Threshold: {threshold:.2f})")
-            return score.item() > threshold
+            print(f"\n[BIOMETRIC] Similarity Score: {score.item():.4f} (Threshold: {self.threshold:.2f})")
+            return score.item() > self.threshold
         except Exception as e:
             print(f"\n[ERROR] Speaker recognition failed: {e}")
-            # In case of internal processing error, we fallback to True to avoid locking out the owner
+            # In case of internal processing error, fallback to True to avoid locking out the owner
             return True
+
+    def listen_and_verify(self, max_attempts: int = 3) -> bool:
+        """Records microphone audio and runs biometric verification.
+        Encapsulates the full 3-attempt loop so it can be called from a
+        background thread (e.g., asyncio.to_thread) without blocking the UI."""
+        import speech_recognition as sr
+
+        recognizer = sr.Recognizer()
+
+        def _get_mic():
+            try:
+                return sr.Microphone(device_index=1)
+            except Exception:
+                return sr.Microphone()
+
+        # One-time ambient noise calibration
+        with _get_mic() as source:
+            print("Calibrating microphone for ambient noise (please remain quiet for 1.5 seconds)...")
+            recognizer.adjust_for_ambient_noise(source, duration=1.5)
+
+        for attempt in range(1, max_attempts + 1):
+            print(f"\n[Attempt {attempt} of {max_attempts}] Please speak a command to authenticate...")
+            with _get_mic() as source:
+                print("[READY] Say something now...")
+                try:
+                    audio = recognizer.listen(source, timeout=8, phrase_time_limit=6)
+                    temp_path = os.path.join(os.path.dirname(__file__), "..", "temp_speech.wav")
+                    with open(temp_path, "wb") as f:
+                        f.write(audio.get_wav_data())
+                    if self.verify(temp_path):
+                        print("✅ Biometric fingerprint verified. Access granted.")
+                        return True
+                    else:
+                        print("❌ Voice signature mismatch.")
+                except sr.WaitTimeoutError:
+                    print("[TIMEOUT] No speech detected.")
+                except Exception as e:
+                    print(f"[ERROR] Auth attempt failed: {e}")
+
+        print("❌ Acoustic fingerprint mismatch. Biometric security protocols engaged.")
+        return False

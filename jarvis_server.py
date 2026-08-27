@@ -33,6 +33,7 @@ from commands import (
     web_search_and_navigate,
     browser_viewport_control,
     create_folder,
+    assistive_shopping_agent,
     open_application,
     close_application,
     system_control,
@@ -77,6 +78,7 @@ tools_map = {
     "web_search_and_navigate":   web_search_and_navigate,
     "browser_viewport_control": browser_viewport_control,
     "create_folder":            create_folder,
+    "assistive_shopping_agent": assistive_shopping_agent,
     "open_application":         open_application,
     "close_application":        close_application,
     "system_control":           system_control,
@@ -336,6 +338,18 @@ async def run_gemini_live() -> None:
                         "properties": {
                             "action": {"type": "STRING", "description": "'scroll_down', 'scroll_up', 'next_tab', 'prev_tab', 'close_tab', or 'select_tab'"},
                             "value":  {"type": "INTEGER", "description": "Scroll pixels (e.g. 500) or tab number (1-9) for 'select_tab'"},
+                        },
+                        "required": ["action"],
+                    },
+                },
+                {
+                    "name": "assistive_shopping_agent",
+                    "description": "Assistive E-Commerce Agent (SDG 10 accessibility for visually impaired users). Autonomously searches e-commerce stores using Playwright to extract product titles and prices to read aloud ('search_product'), or fills out checkout shipping forms and Cash on Delivery choices using user details ('checkout_product').",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "action": {"type": "STRING", "description": "'search_product' or 'checkout_product'"},
+                            "query":  {"type": "STRING", "description": "Product name or search topic"},
                         },
                         "required": ["action"],
                     },

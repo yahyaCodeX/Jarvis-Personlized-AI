@@ -9,8 +9,10 @@ are always answered on time.
 """
 
 import asyncio
+import concurrent.futures
 import json
 import math
+import logging
 import os
 import psutil
 import pyaudio
@@ -23,6 +25,10 @@ import traceback
 import websockets
 import win32com.client
 from dotenv import load_dotenv
+
+# Suppress noisy transient WebSocket handshake disconnect logs from websockets.server
+logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
+logging.getLogger("websockets.protocol").setLevel(logging.CRITICAL)
 from google import genai
 from google.genai import types
 
@@ -30,10 +36,15 @@ from auth.voice_auth import VoiceAuthenticator
 from commands import (
     fetch_ug_attendance,
     youtube_control,
-    web_search_and_navigate,
-    browser_viewport_control,
+    assistive_web_action,
+    assistive_checkout,
+    analyze_active_screen,
+    debug_active_screen_code,
+    read_local_file,
+    write_local_file,
+    find_local_file,
     create_folder,
-    assistive_shopping_agent,
+    open_local_folder,
     open_application,
     close_application,
     system_control,
@@ -42,9 +53,6 @@ from commands import (
     open_website,
     play_on_youtube,
     search_google,
-    browser_tab_control,
-    page_scroll,
-    site_interaction,
     search_maps,
     remember_fact,
     get_all_memories,
@@ -73,25 +81,27 @@ print()
 #  Global state
 # ============================================================
 tools_map = {
-    "check_attendance":         fetch_ug_attendance,
-    "youtube_control":          youtube_control,
-    "web_search_and_navigate":   web_search_and_navigate,
-    "browser_viewport_control": browser_viewport_control,
-    "create_folder":            create_folder,
-    "assistive_shopping_agent": assistive_shopping_agent,
-    "open_application":         open_application,
-    "close_application":        close_application,
-    "system_control":           system_control,
-    "generate_assignment":      generate_assignment,
-    "ask_local_qwen":           ask_local_qwen,
-    "open_website":             open_website,
-    "play_on_youtube":          play_on_youtube,
-    "search_google":            search_google,
-    "browser_tab_control":      browser_tab_control,
-    "page_scroll":              page_scroll,
-    "site_interaction":         site_interaction,
-    "search_maps":              search_maps,
-    "remember_fact":            remember_fact,
+    "check_attendance":        fetch_ug_attendance,
+    "youtube_control":         youtube_control,
+    "assistive_web_action":    assistive_web_action,
+    "assistive_checkout":      assistive_checkout,
+    "analyze_active_screen":   analyze_active_screen,
+    "debug_active_screen_code": debug_active_screen_code,
+    "read_local_file":         read_local_file,
+    "write_local_file":        write_local_file,
+    "find_local_file":         find_local_file,
+    "create_folder":           create_folder,
+    "open_local_folder":       open_local_folder,
+    "open_application":        open_application,
+    "close_application":       close_application,
+    "system_control":          system_control,
+    "generate_assignment":     generate_assignment,
+    "ask_local_qwen":          ask_local_qwen,
+    "open_website":            open_website,
+    "play_on_youtube":         play_on_youtube,
+    "search_google":           search_google,
+    "search_maps":             search_maps,
+    "remember_fact":           remember_fact,
 }
 
 connected_clients:  set            = set()
@@ -139,6 +149,21 @@ async def broadcast(event_type: str, data: dict) -> None:
                          return_exceptions=True)
 
 
+_playwright_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="playwright-worker")
+
+
+def _run_tool_in_clean_thread(fn, *args, **kwargs):
+    def _worker():
+        try:
+            import asyncio
+            asyncio.set_event_loop(None)
+        except Exception:
+            pass
+        return fn(*args, **kwargs)
+    future = _playwright_executor.submit(_worker)
+    return future.result()
+
+
 async def execute_tool_safely(name: str, args: dict) -> str:
     now = time.time()
     if now - _last_tool_timestamps.get(name, 0) < 8.0:
@@ -150,7 +175,7 @@ async def execute_tool_safely(name: str, args: dict) -> str:
         if fn is None:
             return f"Tool '{name}' not recognised."
         try:
-            return str(await asyncio.to_thread(fn, **args))
+            return str(await asyncio.to_thread(_run_tool_in_clean_thread, fn, **args))
         except Exception as exc:
             print(f"[TOOL ERROR] {name}: {exc}")
             return f"Error in {name}: {exc}"
@@ -285,7 +310,24 @@ async def run_gemini_live() -> None:
         "You were created by Muhammad Yahya Siddiqui, a Computer Systems Engineering "
         "student at MUET and a backend software developer. He is your creator and primary user.\n"
         "When asked to remember something, use the `remember_fact` tool.\n"
-        f"Memories from previous sessions:\n{memories}"
+        f"Memories from previous sessions:\n{memories}\n\n"
+        "ASSISTIVE WEB NAVIGATION & CHECKOUT PROTOCOL (SDG 10):\n"
+        "1. Use `assistive_web_action` to search web ('search'), open URLs ('open_url'), select search result by rank ('click_result' with target '1', '2', '3'), scroll pages down/up ('scroll_down'/'scroll_up'), or click text elements ('click_text').\n"
+        "2. When the user asks to open the 1st, 2nd, or 3rd search result or site, invoke `assistive_web_action` with `action: 'click_result'` and `target: '1'`, `'2'`, or `'3'`.\n"
+        "3. If the user asks for prices or text on screen, invoke `analyze_active_screen`.\n"
+        "4. Use `assistive_checkout` ONLY when the user is already on a checkout page and verbally confirms the address choice ('home' for Shikarpur or 'hostel' for Jamshoro) and phone number.\n\n"
+        "E-COMMERCE NAVIGATION PROTOCOL (CRITICAL — follow exactly):\n"
+        "When the user says 'open the first item', 'click the second product', 'open that phone', or any ordinal product reference on a store page:\n"
+        "  Step 1: IMMEDIATELY call `analyze_active_screen` to visually read the exact product name shown on screen (e.g., 'Vivo V80 Lite 5G', 'Nike Air Max 270').\n"
+        "  Step 2: Once you have the exact name from the screen, call `assistive_web_action` with action='click_text' and target set to that EXACT name you just read. Do NOT guess or invent the product name.\n"
+        "  NEVER call `click_result` for product grids — that is for web search engine result pages only.\n\n"
+        "GHOST CODER PROTOCOL:\n"
+        "When the user says 'debug my code', 'why is this crashing', 'look at my screen', 'fix this error', or anything implying a code problem on their screen, IMMEDIATELY call `debug_active_screen_code`. Pass any error message or hint the user mentioned as `issue_hint`.\n\n"
+        "AUTONOMOUS CODER PROTOCOL:\n"
+        "If the user asks you to read, review, or fix a specific file, use `read_local_file` to load its full source code first. "
+        "Once you have identified the bug or improvement, write the completely corrected code back to their machine using `write_local_file`. "
+        "NEVER provide partial code snippets when writing — always write the ENTIRE updated file content so nothing is lost. "
+        "If the user only gives you a file name without a full path, call `find_local_file` first to locate it before reading or writing.\n"
     )
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -318,40 +360,47 @@ async def run_gemini_live() -> None:
                     },
                 },
                 {
-                    "name": "web_search_and_navigate",
-                    "description": "Performs Google search or opens search results immediately: 'google_search' (opens Google search results page) or 'open_result' (opens top Google result or result N).",
+                    "name": "assistive_web_action",
+                    "description": "Universal Smart Navigation Tool. Actions: 'search' (DuckDuckGo search), 'open_url' (open URL or brand name), 'click_result' (click 1st/2nd/3rd SEARCH ENGINE result — NOT for product grids), 'click_text' (click any visible element by its exact displayed text — USE THIS for e-commerce products, buttons, links on any page), 'play_youtube' (search and play video), 'new_tab', 'close_tab', 'switch_tab', 'scroll_down', 'scroll_up'.",
                     "parameters": {
                         "type": "OBJECT",
                         "properties": {
-                            "action":       {"type": "STRING", "description": "'google_search' or 'open_result'"},
-                            "query":        {"type": "STRING", "description": "Search query or topic"},
-                            "result_index": {"type": "INTEGER", "description": "1-based result index when action is 'open_result'"},
+                            "action": {"type": "STRING", "description": "'search', 'open_url', 'click_result', 'click_text', 'play_youtube', 'new_tab', 'close_tab', 'switch_tab', 'scroll_down', or 'scroll_up'"},
+                            "target": {"type": "STRING", "description": "Search query, URL, result rank (1/2/3), exact product/button text to click, or YouTube query"},
                         },
                         "required": ["action"],
                     },
                 },
                 {
-                    "name": "browser_viewport_control",
-                    "description": "Controls active browser scrolling and tab management: 'scroll_down', 'scroll_up', 'next_tab', 'prev_tab', 'close_tab', or 'select_tab'.",
+                    "name": "assistive_checkout",
+                    "description": "Injects predefined shipping & checkout details into the currently open active browser page after user verbally confirms address choice ('home' for Shikarpur or 'hostel' for Jamshoro) and contact phone number.",
                     "parameters": {
                         "type": "OBJECT",
                         "properties": {
-                            "action": {"type": "STRING", "description": "'scroll_down', 'scroll_up', 'next_tab', 'prev_tab', 'close_tab', or 'select_tab'"},
-                            "value":  {"type": "INTEGER", "description": "Scroll pixels (e.g. 500) or tab number (1-9) for 'select_tab'"},
+                            "address_choice": {"type": "STRING", "description": "'home' (Siddiqui Street, Boot Bazar, Shikarpur) or 'hostel' (AQ Boys Hostel, MUET Jamshoro)"},
+                            "custom_phone":   {"type": "STRING", "description": "Optional phone number if different from default 03163434749"},
                         },
-                        "required": ["action"],
+                        "required": ["address_choice"],
                     },
                 },
                 {
-                    "name": "assistive_shopping_agent",
-                    "description": "Assistive E-Commerce Agent (SDG 10 accessibility for visually impaired users). Autonomously searches e-commerce stores using Playwright to extract product titles and prices to read aloud ('search_product'), or fills out checkout shipping forms and Cash on Delivery choices using user details ('checkout_product').",
+                    "name": "analyze_active_screen",
+                    "description": "Screen Vision Tool for SDG 10 visually impaired accessibility. Captures active screen and inspects product prices, details, or text displayed on screen.",
                     "parameters": {
                         "type": "OBJECT",
                         "properties": {
-                            "action": {"type": "STRING", "description": "'search_product' or 'checkout_product'"},
-                            "query":  {"type": "STRING", "description": "Product name or search topic"},
+                            "query": {"type": "STRING", "description": "Item or product name to find on screen"},
                         },
-                        "required": ["action"],
+                    },
+                },
+                {
+                    "name": "debug_active_screen_code",
+                    "description": "Ghost Coder: takes a high-quality screenshot of the user's active IDE, terminal, or browser and uses Gemini Vision to identify programming errors, bugs, crashes, missing imports, or wrong annotations — then explains the exact fix. Call this when the user asks to debug their code, look at their screen, or figure out why their app is crashing.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "issue_hint": {"type": "STRING", "description": "Optional hint from the user about what is crashing or what they are trying to fix (e.g. 'NullPointerException', 'app won\'t start')."},
+                        },
                     },
                 },
                 {
@@ -373,6 +422,17 @@ async def run_gemini_live() -> None:
                         "type": "OBJECT",
                         "properties": {"query": {"type": "STRING"}},
                         "required": ["query"],
+                    },
+                },
+                {
+                    "name": "open_local_folder",
+                    "description": "Opens a local folder in Windows File Explorer. Navigates an existing Explorer window if one is already open, or opens a new one. Use for Desktop, Downloads, Documents, D:\\Development, or any absolute path.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "target_path": {"type": "STRING", "description": "Absolute path or common location like Desktop, Downloads, Documents"},
+                        },
+                        "required": ["target_path"],
                     },
                 },
                 {
@@ -477,6 +537,41 @@ async def run_gemini_live() -> None:
                         "type": "OBJECT",
                         "properties": {"fact": {"type": "STRING"}},
                         "required": ["fact"],
+                    },
+                },
+                {
+                    "name": "read_local_file",
+                    "description": "Reads the full text or source code of any local file on the user's computer. Use this to analyze codebases, review configs, or inspect logs before making changes.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "filepath": {"type": "STRING", "description": "Absolute or relative path to the file to read (e.g. 'D:/Development/My-Personal-AI/commands.py')."},
+                        },
+                        "required": ["filepath"],
+                    },
+                },
+                {
+                    "name": "write_local_file",
+                    "description": "Overwrites a local file with completely new code or content. Use this to autonomously fix bugs and save the corrected file directly to the user's machine. ALWAYS write the ENTIRE file — never partial snippets.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "filepath":    {"type": "STRING", "description": "Absolute or relative path to the file to write."},
+                            "new_content": {"type": "STRING", "description": "The complete, fully corrected code/content to write to the file."},
+                        },
+                        "required": ["filepath", "new_content"],
+                    },
+                },
+                {
+                    "name": "find_local_file",
+                    "description": "Recursively searches the local file system for a file by name or partial name. ALWAYS call this before `read_local_file` or `write_local_file` if you do not know the exact absolute path. Never guess file paths.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "filename": {"type": "STRING", "description": "The file name or partial name to search for (e.g. 'commands.py', 'MainActivity')."},
+                            "root_dir": {"type": "STRING", "description": "Directory to start searching from. Defaults to current directory. Use 'D:/Development' for the user's main projects folder."},
+                        },
+                        "required": ["filename"],
                     },
                 },
             ]
@@ -808,13 +903,13 @@ async def handler(websocket) -> None:
                 await broadcast("status", {"state": "idle", "message": "Session terminated."})
                 await asyncio.to_thread(speak_tts, "Session terminated.")
 
-    except websockets.ConnectionClosed:
+    except (websockets.ConnectionClosed, websockets.exceptions.InvalidMessage, EOFError):
         pass
     except Exception as exc:
         print(f"[WS ERROR] {exc}")
     finally:
         connected_clients.discard(websocket)
-        print(f"[WS] Flutter disconnected: {websocket.remote_address}")
+        print("[WS] Client connection closed.")
 
 
 # ============================================================

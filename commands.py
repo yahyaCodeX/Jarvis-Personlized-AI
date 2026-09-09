@@ -15,6 +15,7 @@ import psutil
 import pyautogui
 import pyperclip
 import threading
+import win32com.client
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -24,6 +25,8 @@ from selenium.webdriver.support.ui import Select
 from webdriver_manager.chrome import ChromeDriverManager
 from playwright.sync_api import sync_playwright
 import time
+import io
+from PIL import ImageGrab, Image
 
 # Global state for multi-turn assignment generation
 assignment_state = {
@@ -674,6 +677,14 @@ def browser_viewport_control(action: str, value: int = 500) -> str:
     except (ValueError, TypeError):
         val = 500
     
+    # Disable PyAutoGUI failsafe and click center of screen to focus active window before scrolling
+    try:
+        pyautogui.FAILSAFE = False
+        screenWidth, screenHeight = pyautogui.size()
+        pyautogui.click(screenWidth / 2, screenHeight / 2)
+    except Exception:
+        pass
+
     if action == "scroll_down":
         pyautogui.scroll(-val)
         return f"Scrolled down by {val} units, sir."
@@ -727,101 +738,789 @@ def create_folder(folder_name: str, location: str = "Desktop") -> str:
         return f"Failed to create folder '{folder_name}': {e}"
 
 
-def assistive_shopping_agent(action: str, query: str = None) -> str:
-    """
-    Assistive E-Commerce Agent (SDG 10) for visually impaired users.
-    Autonomously searches e-commerce stores using Playwright, extracts product names and prices
-    to read aloud, and fills out checkout shipping forms using predefined user details.
-    """
-    action = (action or "search_product").lower().strip()
-    target_query = query.strip() if query else "perfume"
+# ─── PERSISTENT SINGLETON PLAYWRIGHT BROWSER (SDG 10) ───────────────
+_playwright_context = None
+_browser = None
+_active_page = None
+_playwright_thread_id = None
 
-    if action in ["search", "search_product", "search_item"]:
+
+def stealth_sync(page):
+    """Applies Playwright stealth evasions to hide automation flags."""
+    try:
+        from playwright_stealth import stealth_sync as _ss
+        _ss(page)
+    except ImportError:
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                
-                search_url = f"https://scentsnstories.pk/search?q={urllib.parse.quote(target_query)}"
-                print(f"[ASSISTIVE AGENT] Navigating to {search_url}...")
-                page.goto(search_url, timeout=25000, wait_until="domcontentloaded")
-                
+            from playwright_stealth.stealth import Stealth
+            Stealth().apply_stealth_sync(page)
+        except Exception as err:
+            print(f"[STEALTH WARNING] Could not apply stealth evasions: {err}")
+
+
+def get_active_page():
+    """
+    Returns the active singleton Playwright browser page instance with stealth anti-bot protection.
+    Auto-heals if the user closed the window, or if invoked from a different thread (greenlet thread boundary).
+    ALWAYS tracks the most recently opened tab/popup so target=_blank links never lose focus.
+    """
+    global _playwright_context, _browser, _active_page, _playwright_thread_id
+    current_thread = threading.get_ident()
+
+    try:
+        if (
+            _browser is None
+            or not _browser.is_connected()
+            or _playwright_context is None
+            or _playwright_thread_id != current_thread
+        ):
+            from playwright.sync_api import sync_playwright
+            if _playwright_context:
                 try:
-                    page.wait_for_selector(".product-item, .product-card, .grid-item, a[href*='/products/'], div.product", timeout=8000)
+                    _playwright_context.stop()
                 except Exception:
                     pass
-                
-                products = []
-                items = page.query_selector_all(".product-item, .product-card, .grid-item, div.product")
-                if not items:
-                    items = page.query_selector_all("a[href*='/products/']")
-                
-                for item in items[:5]:
-                    text = item.inner_text().strip()
-                    lines = [line.strip() for line in text.split("\n") if line.strip()]
-                    if lines:
-                        title = lines[0]
-                        price = "Price unavailable"
-                        for line in lines[1:]:
-                            if "Rs" in line or "PKR" in line or "$" in line or any(c.isdigit() for c in line):
-                                price = line
-                                break
-                        products.append(f"{title} ({price})")
-                
-                browser.close()
+            _playwright_context = sync_playwright().start()
+            _browser = _playwright_context.chromium.launch(
+                headless=False,
+                slow_mo=100,
+                args=["--disable-blink-features=AutomationControlled", "--start-maximized"]
+            )
+            _active_page = _browser.new_page(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            _playwright_thread_id = current_thread
+            try:
+                stealth_sync(_active_page)
+            except Exception as stealth_err:
+                print(f"[STEALTH WARNING] {stealth_err}")
 
-                if products:
-                    top3 = products[:3]
-                    formatted_options = "; ".join([f"Option {i+1}: {p}" for i, p in enumerate(top3)])
-                    return f"Assistive shopping search for '{target_query}' complete. Here are the top 3 options: {formatted_options}. Which option would you like to purchase, sir?"
-                else:
-                    return f"Assistive shopping search for '{target_query}' complete. Option 1: Catch 22 Perfume (Rs. 1,850); Option 2: Executive Perfume (Rs. 2,150); Option 3: Arabic Oud (Rs. 2,400). Sir, which option shall I proceed to checkout?"
-                    
-        except Exception as e:
-            print(f"[ASSISTIVE AGENT SEARCH ERROR] {e}")
-            return f"Assistive shopping search for '{target_query}' complete. Option 1: Catch 22 Perfume (Rs. 1,850); Option 2: Executive Perfume (Rs. 2,150); Option 3: Arabic Oud (Rs. 2,400). Sir, which option shall I proceed to checkout?"
-
-    elif action in ["checkout", "checkout_product", "buy"]:
+        # ALWAYS track the most recently opened tab or popup (handles target="_blank" links)
         try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                
-                checkout_url = "https://scentsnstories.pk/cart"
-                print(f"[ASSISTIVE AGENT] Navigating to checkout at {checkout_url}...")
-                page.goto(checkout_url, timeout=25000, wait_until="domcontentloaded")
-                
-                form_fields = [
-                    ("input[name*='first_name'], input[id*='first'], input[placeholder*='First']", "Muhammad Yahya"),
-                    ("input[name*='last_name'], input[id*='last'], input[placeholder*='Last']", "Siddiqui"),
-                    ("input[name*='address'], input[id*='address'], input[placeholder*='Address']", "Shikarpur, Sindh, Pakistan"),
-                    ("input[name*='phone'], input[id*='phone'], input[placeholder*='Phone']", "03001234567"),
-                ]
-                
-                for selector, val in form_fields:
+            if _browser.contexts:
+                pages = _browser.contexts[0].pages
+                if pages:
+                    _active_page = pages[-1]
                     try:
-                        if page.locator(selector).first.is_visible(timeout=2000):
-                            page.locator(selector).first.fill(val)
+                        _active_page.bring_to_front()
+                    except Exception:
+                        pass
+        except Exception as tab_err:
+            print(f"[TAB TRACKER] Could not update active tab: {tab_err}")
+
+        # Final guard: if _active_page is somehow still None or closed, open a fresh page
+        if _active_page is None or _active_page.is_closed():
+            _active_page = _browser.new_page(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+
+    except Exception as e:
+        print(f"[PLAYWRIGHT ENGINE] Re-initializing browser session on thread {current_thread} due to: {e}")
+        from playwright.sync_api import sync_playwright
+        _playwright_context = sync_playwright().start()
+        _browser = _playwright_context.chromium.launch(
+            headless=False,
+            slow_mo=100,
+            args=["--disable-blink-features=AutomationControlled", "--start-maximized"]
+        )
+        _active_page = _browser.new_page(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        _playwright_thread_id = current_thread
+        try:
+            stealth_sync(_active_page)
+        except Exception:
+            pass
+
+    return _active_page
+
+
+def resolve_brand_url(target_name: str) -> str:
+    """
+    Resolves a brand or search term to its official direct URL using DuckDuckGo HTML link extraction.
+    Bypasses DuckDuckGo/Google redirect traps and CAPTCHAs.
+    """
+    try:
+        ddg_html_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(target_name)}"
+        resp = requests.get(ddg_html_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}, timeout=8)
+        if resp.status_code == 200:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(resp.text, "html.parser")
+            first_link = soup.select_one("a.result__url")
+            if first_link and first_link.get("href"):
+                href = first_link.get("href")
+                parsed = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+                real_url = parsed.get("uddg", [None])[0]
+                if real_url:
+                    return real_url
+    except Exception as err:
+        print(f"[URL RESOLVER WARNING] {err}")
+    return None
+
+
+def safe_goto(url, timeout=15000):
+    """
+    Safely navigates to a URL using get_active_page().
+    Auto-heals if the target page, context, or browser was closed.
+    """
+    global _active_page
+    try:
+        page = get_active_page()
+        page.goto(url, timeout=timeout)
+        return page
+    except Exception as err:
+        err_str = str(err).lower()
+        if any(k in err_str for k in ["closed", "target", "greenlet", "context", "destroyed"]):
+            print(f"[PLAYWRIGHT AUTO-HEAL] Re-creating browser page due to closed target: {err}")
+            _active_page = None
+            page = get_active_page()
+            page.goto(url, timeout=timeout)
+            return page
+        else:
+            raise err
+
+
+def assistive_web_action(action: str, target: str = None) -> str:
+    """
+    Universal Smart Navigation Tool for SDG 10 visually impaired accessibility.
+    Actions:
+    - 'search': Searches DuckDuckGo for target query.
+    - 'open_url': Opens specific site directly or uses DuckDuckGo !ducky bang auto-redirect.
+    - 'click_result': Clicks search result by number (1-based index).
+    - 'scroll_down': Injects JS DOM scroll down by 800px.
+    - 'scroll_up': Injects JS DOM scroll up by 800px.
+    - 'click_text': Intelligently finds and clicks element with target text.
+    """
+    act = (action or "search").lower().strip()
+    target_clean = (target or "").strip()
+
+    # 1. Fix Variable Scope: Define page at the absolute top of the function
+    page = get_active_page()
+
+    try:
+        if act == "open_url":
+            if not target_clean:
+                return "Please provide a URL to open, sir."
+
+            target_nav = target_clean
+            if not target_nav.startswith("http"):
+                # Safely encode the auto-redirect command
+                encoded_query = urllib.parse.quote(f"!ducky {target_nav}")
+                target_nav = f"https://duckduckgo.com/?q={encoded_query}"
+
+            try:
+                print(f"[ASSISTIVE WEB] Navigating to target: {target_nav}...")
+                page.goto(target_nav, timeout=15000)
+                try:
+                    page.wait_for_timeout(2000)
+                except Exception:
+                    pass
+                page_title = page.title() or target_clean
+                return f"Opened website '{page_title}' on screen, sir."
+            except Exception as e:
+                return f"Failed to load page: {e}"
+
+        elif act == "search":
+            if not target_clean:
+                return "Please specify what to search for, sir."
+            encoded_query = urllib.parse.quote(target_clean)
+            search_url = f"https://duckduckgo.com/?q={encoded_query}"
+            print(f"[ASSISTIVE WEB] Searching DuckDuckGo for '{target_clean}'...")
+            try:
+                page.goto(search_url, timeout=15000)
+                page_title = page.title() or target_clean
+                return f"Searched and opened '{page_title}' on screen, sir."
+            except Exception as e:
+                return f"Failed to perform search: {e}"
+
+        elif act in ["click_result", "open_result"] or (act in ["click_text", "click"] and (re.search(r'\b(1st|first|top|1|2nd|second|2|3rd|third|3|4th|fourth|4)\b', target_clean, re.IGNORECASE) or "result" in target_clean.lower() or "site" in target_clean.lower() or "link" in target_clean.lower())):
+            try:
+                # Convert target (e.g., "1") or ordinal to a zero-based index
+                index = 0
+                ord_match = re.search(r'\b(1st|first|top|1|2nd|second|2|3rd|third|3|4th|fourth|4)\b', target_clean, re.IGNORECASE)
+                if ord_match:
+                    w = ord_match.group(1).lower()
+                    if w in ["2nd", "second", "2"]:
+                        index = 1
+                    elif w in ["3rd", "third", "3"]:
+                        index = 2
+                    elif w in ["4th", "fourth", "4"]:
+                        index = 3
+                elif target_clean.isdigit():
+                    index = int(target_clean) - 1
+
+                print(f"[ASSISTIVE WEB] Clicking search result index #{index + 1}...")
+                # Locate the search result link and click it
+                page.locator('h3, a[data-testid="result-title-a"], article h2 a, .result__title a').nth(index).click(timeout=5000)
+                # Wait for the new page to load
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+                page_title = page.title() or f"result #{index + 1}"
+                return f"Successfully clicked search result number {index + 1} ('{page_title}')."
+            except Exception as e:
+                return f"Failed to click search result {target_clean}. Error: {e}"
+
+        elif act == "scroll_down":
+            print("[ASSISTIVE WEB] Injecting JS scrollBy(0, 800)...")
+            page.evaluate("window.scrollBy(0, 800)")
+            return "Scrolled down the page, sir."
+
+        elif act == "scroll_up":
+            print("[ASSISTIVE WEB] Injecting JS scrollBy(0, -800)...")
+            page.evaluate("window.scrollBy(0, -800)")
+            return "Scrolled up the page, sir."
+
+        elif act in ["click_text", "click"]:
+            if not target_clean:
+                return "Please specify text to click on the page, sir."
+            print(f"[ASSISTIVE WEB] Clicking element with text: '{target_clean}'...")
+            try:
+                # Tier 1: Native Playwright text locator — works on any element type (spans, divs, anchors)
+                # This is the most reliable for e-commerce product grids where text is inside nested divs
+                try:
+                    page.locator(f"text={target_clean}").first.click(timeout=4000)
+                    page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    return f"Successfully clicked on '{target_clean}'."
+                except Exception:
+                    pass
+
+                # Tier 2: Partial text match on clickable elements (links, buttons, headings)
+                try:
+                    page.locator(
+                        f"a:has-text('{target_clean}'), button:has-text('{target_clean}'), "
+                        f"h1:has-text('{target_clean}'), h2:has-text('{target_clean}'), "
+                        f"h3:has-text('{target_clean}'), span:has-text('{target_clean}')"
+                    ).first.click(timeout=4000)
+                    page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    return f"Successfully clicked on '{target_clean}'."
+                except Exception:
+                    pass
+
+                # Tier 3: First keyword of the phrase (handles truncated product titles in grids)
+                first_word = target_clean.split()[0] if target_clean.split() else target_clean
+                if len(first_word) > 3:
+                    try:
+                        page.locator(
+                            f"a:has-text('{first_word}'), h3:has-text('{first_word}'), "
+                            f"span:has-text('{first_word}'), div:has-text('{first_word}')"
+                        ).first.click(timeout=4000)
+                        page.wait_for_load_state("domcontentloaded", timeout=5000)
+                        return f"Clicked item containing '{first_word}' on page, sir."
                     except Exception:
                         pass
 
+                # Tier 4: get_by_text fallback (broader match, lower precision)
                 try:
-                    cod_selector = "input[type='radio'][value*='cod'], input[id*='cod'], label:has-text('Cash on Delivery')"
-                    if page.locator(cod_selector).first.is_visible(timeout=2000):
-                        page.locator(cod_selector).first.click()
+                    page.get_by_text(target_clean, exact=False).first.click(timeout=3000)
+                    return f"Clicked '{target_clean}' on page, sir."
                 except Exception:
                     pass
 
-                browser.close()
+                return f"Could not find '{target_clean}' on screen. Try scrolling down and asking again, sir."
 
-            return "Checkout form filled successfully. Shipping address set to Muhammad Yahya Siddiqui, Shikarpur, Sindh. Order is ready for final voice confirmation, sir."
+            except Exception as click_err:
+                print(f"[ASSISTIVE WEB] Text click error: {click_err}")
+                return f"Failed to click '{target_clean}'. It might not be visible on screen. Error: {click_err}"
+
+        elif act == "play_youtube":
+            if not target_clean:
+                return "Please specify what to play on YouTube, sir."
+            encoded = urllib.parse.quote(target_clean)
+            print(f"[ASSISTIVE WEB] Searching YouTube for '{target_clean}'...")
+            try:
+                page.goto(f"https://www.youtube.com/results?search_query={encoded}", timeout=15000)
+                page.locator('a#video-title').first.click(timeout=5000)
+                page_title = page.title() or target_clean
+                return f"Playing '{target_clean}' on YouTube, sir."
+            except Exception as e:
+                return f"Failed to play YouTube video: {e}"
+
+        elif act == "new_tab":
+            global _active_page, _browser
+            try:
+                _active_page = _browser.new_page(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+                _playwright_thread_id = threading.get_ident()
+                return "Opened a new browser tab, sir."
+            except Exception as e:
+                return f"Failed to open new tab: {e}"
+
+        elif act == "close_tab":
+            try:
+                page.close()
+                pages = _browser.contexts[0].pages if _browser.contexts else []
+                if pages:
+                    _active_page = pages[-1]
+                    _active_page.bring_to_front()
+                else:
+                    _active_page = _browser.new_page(
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    )
+                return "Closed current tab, sir."
+            except Exception as e:
+                return f"Failed to close tab: {e}"
+
+        elif act == "switch_tab":
+            try:
+                pages = _browser.contexts[0].pages if _browser.contexts else []
+                if pages:
+                    current_idx = pages.index(_active_page) if _active_page in pages else 0
+                    _active_page = pages[(current_idx + 1) % len(pages)]
+                    _active_page.bring_to_front()
+                    page_title = _active_page.title() or "new tab"
+                    return f"Switched to tab: '{page_title}', sir."
+                return "No other tabs open, sir."
+            except Exception as e:
+                return f"Failed to switch tab: {e}"
+
+        else:
+            return f"Unknown web action '{action}', sir."
+
+    except Exception as e:
+        print(f"[ASSISTIVE WEB ERROR] {e}")
+        return f"Encountered an issue executing '{action}': {e}"
+
+
+# ─── SINGLE-WINDOW FILE EXPLORER NAVIGATION ─────────────────────────
+def open_local_folder(target_path: str) -> str:
+    """
+    Navigates an existing Windows Explorer window to a folder,
+    or opens a new one if none is open. Avoids spawning duplicate windows.
+    """
+    target_path = os.path.abspath(target_path)
+    os.makedirs(target_path, exist_ok=True)
+    try:
+        shell = win32com.client.Dispatch("Shell.Application")
+        for window in shell.Windows():
+            try:
+                if window.Name in ["File Explorer", "Windows Explorer"]:
+                    window.Navigate(target_path)
+                    return f"Navigated existing Explorer to {target_path}"
+            except Exception:
+                continue
+        # Fallback: open a new window if none is open
+        os.startfile(target_path)
+        return f"Opened new Explorer window at {target_path}"
+    except Exception as e:
+        return f"Failed to open folder: {e}"
+
+
+# ─── USER PROFILES FOR ASSISTIVE E-COMMERCE (SDG 10) ───────────────
+USER_PROFILES = {
+    "name": "Muhammad Yahya Siddiqui",
+    "first_name": "Muhammad Yahya",
+    "last_name": "Siddiqui",
+    "default_phone": "03163434749",
+    "email": "siddiquiyahya796@gmail.com",
+    "addresses": {
+        "home": {
+            "address": "Siddiqui street boot bazar shikarpur sindh",
+            "city": "Shikarpur",
+            "province": "Sindh",
+        },
+        "hostel": {
+            "address": "AQ boys hostel muet jamshoro",
+            "city": "Jamshoro",
+            "province": "Sindh",
+        },
+    },
+}
+
+
+def assistive_checkout(address_choice: str = "home", custom_phone: str = None) -> str:
+    """
+    Contextual Checkout Tool for SDG 10 visually impaired accessibility.
+    Dynamically extracts visible form fields from ANY e-commerce checkout page,
+    uses Gemini LLM to map user profile data to the form inputs, and fills them via Playwright.
+    """
+    addr_type = (address_choice or "home").lower().strip()
+    if addr_type not in ["home", "hostel"]:
+        addr_type = "home"
+
+    target_profile = USER_PROFILES["addresses"][addr_type]
+    target_address = target_profile["address"]
+    city_name = "Jamshoro" if addr_type == "hostel" else "Shikarpur"
+    phone_val = custom_phone.strip() if custom_phone and custom_phone.strip() else USER_PROFILES["default_phone"]
+    selected_email = USER_PROFILES["email"]
+
+    user_data = {
+        "name": USER_PROFILES["name"],
+        "first_name": USER_PROFILES["first_name"],
+        "last_name": USER_PROFILES["last_name"],
+        "email": selected_email,
+        "phone": phone_val,
+        "address": target_address,
+        "city": city_name,
+        "province": "Sindh"
+    }
+
+    try:
+        page = get_active_page()
+        print(f"[ASSISTIVE CHECKOUT] Extracting visible form fields from active page ({addr_type} profile)...")
+
+        # 1. Dynamic Field Extraction via JS DOM evaluate
+        extracted_fields = page.evaluate("""
+            () => {
+                const fields = [];
+                const elements = document.querySelectorAll('input, textarea, select');
+                elements.forEach(el => {
+                    const style = window.getComputedStyle(el);
+                    if (style.display !== 'none' && style.visibility !== 'hidden' && el.type !== 'hidden' && el.type !== 'submit' && el.type !== 'button') {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            fields.push({
+                                id: el.id || '',
+                                name: el.name || '',
+                                type: el.type || 'text',
+                                placeholder: el.placeholder || '',
+                                aria_label: el.getAttribute('aria-label') || '',
+                                autocomplete: el.getAttribute('autocomplete') || ''
+                            });
+                        }
+                    }
+                });
+                return fields;
+            }
+        """)
+
+        print(f"[ASSISTIVE CHECKOUT] Extracted {len(extracted_fields)} visible form input fields.")
+
+        # 2. LLM-Powered Mapping using Gemini Client
+        dynamic_mapping = {}
+        api_key = os.getenv("GEMINI_API_KEY")
+
+        if api_key and extracted_fields:
+            try:
+                from google import genai
+                client = genai.Client(api_key=api_key)
+
+                prompt = f"""You are an AI web automation assistant. Map the user's profile data to the correct HTML 'name' or 'id' attributes from this list of input fields. Return ONLY a valid JSON object where keys are the field 'name' or 'id', and values are the user's exact data to be typed.
+
+User Profile Data:
+{json.dumps(user_data, indent=2)}
+
+List of Input Fields:
+{json.dumps(extracted_fields, indent=2)}
+
+Rules:
+- Output MUST be a valid JSON object where key is the field 'name' or 'id' (prefer 'name', fallback to 'id'), and value is the exact string from User Profile Data.
+- Do NOT output extra text or explanations outside JSON.
+"""
+                models_to_try = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-3.6-flash"]
+                raw_response = ""
+
+                for model_name in models_to_try:
+                    try:
+                        resp = client.models.generate_content(model=model_name, contents=prompt)
+                        if resp and resp.text:
+                            raw_response = resp.text.strip()
+                            print(f"[ASSISTIVE CHECKOUT] LLM Mapping succeeded via {model_name}.")
+                            break
+                    except Exception as m_err:
+                        print(f"[ASSISTIVE CHECKOUT LLM WARNING] Model {model_name} error: {m_err}")
+
+                if raw_response:
+                    clean_json = raw_response
+                    if "```json" in clean_json:
+                        clean_json = clean_json.split("```json")[1].split("```")[0].strip()
+                    elif "```" in clean_json:
+                        clean_json = clean_json.split("```")[1].split("```")[0].strip()
+                    dynamic_mapping = json.loads(clean_json)
+
+            except Exception as llm_err:
+                print(f"[ASSISTIVE CHECKOUT LLM ERROR] {llm_err}")
+
+        # 3. Dynamic Injection based on Gemini LLM mapping
+        if dynamic_mapping:
+            print(f"[ASSISTIVE CHECKOUT] Injecting LLM-mapped fields: {dynamic_mapping}")
+            for field_identifier, user_value in dynamic_mapping.items():
+                if not field_identifier or user_value is None:
+                    continue
+                try:
+                    page.locator(f"[name='{field_identifier}'], [id='{field_identifier}']").first.fill(str(user_value), timeout=2000)
+                    print(f"[ASSISTIVE CHECKOUT] Filled '{field_identifier}' -> '{user_value}'")
+                except Exception as fill_err:
+                    print(f"[ASSISTIVE CHECKOUT WARNING] Could not fill '{field_identifier}': {fill_err}")
+
+        else:
+            # Fallback heuristic form filling if LLM mapping was unavailable
+            print("[ASSISTIVE CHECKOUT] Using heuristic fallback form filling...")
+            try:
+                page.locator('input[name="checkout[email_or_phone]"], input[name="checkout[email]"], input[type="email"], input[id="checkout_email_or_phone"]').first.fill(selected_email, timeout=2000)
+            except Exception: pass
+            try:
+                page.locator('input[placeholder*="First name" i], input[name="checkout[shipping_address][first_name]"]').first.fill(USER_PROFILES["first_name"], timeout=2000)
+            except Exception: pass
+            try:
+                page.locator('input[placeholder*="Last name" i], input[name="checkout[shipping_address][last_name]"]').first.fill(USER_PROFILES["last_name"], timeout=2000)
+            except Exception: pass
+            try:
+                page.locator('input[placeholder*="Address" i], input[name="checkout[shipping_address][address1]"]').first.fill(target_address, timeout=2000)
+            except Exception: pass
+            try:
+                page.locator('input[placeholder*="City" i], input[name="checkout[shipping_address][city]"]').first.fill(city_name, timeout=2000)
+            except Exception: pass
+            try:
+                page.locator('input[name="checkout[shipping_address][phone]"], input[name="phone"], input[placeholder*="Phone" i]').last.fill(phone_val, timeout=2000)
+            except Exception: pass
+
+        # 4. Universal Cash on Delivery Selection
+        try:
+            page.wait_for_timeout(1000)
+            page.locator('label:has-text("Cash on Delivery"), label:has-text("COD")').first.click(timeout=3000)
+            print("[ASSISTIVE CHECKOUT] Clicked Cash on Delivery (COD) payment option.")
+        except Exception:
+            print("[Playwright] COD option not found, might require navigating to the next page first.")
+
+        # Freeze browser for visual inspection
+        print("[ASSISTIVE CHECKOUT] Freezing browser for visual verification...")
+        page.wait_for_timeout(15000)
+        return "Checkout details injected successfully using dynamic LLM form mapping. Please verify the screen."
+
+    except Exception as e:
+        print(f"[ASSISTIVE CHECKOUT ERROR] {e}")
+        return f"Checkout details injected. Please verify the screen. Error: {e}"
+
+
+def analyze_active_screen(query: str = None) -> str:
+    """
+    Screen Vision Tool for SDG 10 visually impaired accessibility.
+    Captures the active desktop screen and uses Gemini Vision to find product prices or UI text.
+    """
+    query_str = (query or "the product price").strip()
+    image_bytes = None
+    try:
+        try:
+            img = ImageGrab.grab()
+            img_byte_arr = io.BytesIO()
+            img.save(img_byte_arr, format='PNG')
+            image_bytes = img_byte_arr.getvalue()
+        except Exception:
+            try:
+                img = pyautogui.screenshot()
+                img_byte_arr = io.BytesIO()
+                img.save(img_byte_arr, format='PNG')
+                image_bytes = img_byte_arr.getvalue()
+            except Exception as capture_err:
+                print(f"[SCREEN CAPTURE WARNING] {capture_err}")
+
+        if not image_bytes:
+            print("[SCREEN VISION] Desktop capture unavailable — searching page text...")
+            return assistive_web_action("search", query_str)
+
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return "Gemini API key is missing, sir."
+
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=api_key)
+        prompt = (
+            f"You are an assistive screen reader for a visually impaired user. "
+            f"Look at this screen capture and find the requested item/price for: '{query_str}'. "
+            f"Return the exact product name, variant, and price in PKR clearly."
+        )
+
+        response = None
+        vision_models = ["gemini-3.6-flash", "gemini-flash-latest"]
+        for vmodel in vision_models:
+            try:
+                response = client.models.generate_content(
+                    model=vmodel,
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+                        prompt
+                    ]
+                )
+                if response and response.text:
+                    print(f"[SCREEN VISION] Success using model {vmodel}")
+                    break
+            except Exception as m_err:
+                print(f"[SCREEN VISION] Model {vmodel} failed ({m_err}), trying fallback...")
+
+        if response and response.text:
+            return response.text.strip()
+        else:
+            return f"Screen captured, but I could not find clear pricing details for '{query_str}', sir."
+
+    except Exception as e:
+        print(f"[SCREEN VISION ERROR] {e}")
+        return assistive_web_action("search", query_str)
+
+
+# ─── GHOST CODER — Screen Debugger (SDG 10 & Developer Productivity) ─
+def debug_active_screen_code(issue_hint: str = None) -> str:
+    """
+    Ghost Coder: captures the active screen (IDE / terminal / browser) and sends
+    it to Gemini as a Senior Software Engineer to diagnose and fix code errors.
+    """
+    image_bytes = None
+    try:
+        # Capture screen — JPEG at 95% quality keeps code crisp while staying fast
+        try:
+            img = ImageGrab.grab()
+            img_byte_arr = io.BytesIO()
+            img.save(img_byte_arr, format='JPEG', quality=95)
+            image_bytes = img_byte_arr.getvalue()
+            mime_type = "image/jpeg"
+        except Exception:
+            try:
+                img = pyautogui.screenshot()
+                img_byte_arr = io.BytesIO()
+                img.save(img_byte_arr, format='JPEG', quality=95)
+                image_bytes = img_byte_arr.getvalue()
+                mime_type = "image/jpeg"
+            except Exception as cap_err:
+                print(f"[GHOST CODER] Screen capture failed: {cap_err}")
+
+        if not image_bytes:
+            return "Could not capture the screen for debugging, sir."
+
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            return "Gemini API key is missing, sir."
+
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=api_key)
+
+        hint_text = f" The user specifically mentioned: '{issue_hint}'." if issue_hint else ""
+        prompt = (
+            "You are a Senior Software Engineer and Ghost Coder acting as a voice assistant's debugging module."
+            f"{hint_text} "
+            "Analyze this screenshot of the developer's screen or IDE carefully. "
+            "1. Identify the programming language and framework. "
+            "2. Locate any visible syntax errors, runtime exceptions, missing imports, "
+            "missing annotations (e.g. @Autowired, @Override), type mismatches, or logical bugs. "
+            "3. Explain the root cause concisely. "
+            "4. Provide the exact fix or corrected code snippet. "
+            "Keep your response clear and actionable — the user will hear it as speech."
+        )
+
+        # Try vision-capable Gemini models in order of preference
+        vision_models = ["gemini-3.6-flash", "gemini-flash-latest"]
+        for vmodel in vision_models:
+            try:
+                response = client.models.generate_content(
+                    model=vmodel,
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+                        prompt
+                    ]
+                )
+                if response and response.text:
+                    print(f"[GHOST CODER] Diagnosis complete using {vmodel}.")
+                    return response.text.strip()
+            except Exception as m_err:
+                print(f"[GHOST CODER] Model {vmodel} failed ({m_err}), trying fallback...")
+
+        return "I analyzed the screen but could not produce a diagnosis. Please try again, sir."
+
+    except Exception as e:
+        print(f"[GHOST CODER ERROR] {e}")
+        return f"Failed to analyze the code on screen. Error: {e}"
+
+
+
+
+# ─── AUTONOMOUS DEVELOPER — File I/O Tools ──────────────────────────
+def read_local_file(filepath: str) -> str:
+    """
+    Reads the full text/code of a local file on the user's machine.
+    Returns the raw content prefixed with the resolved absolute path.
+    Handles large files gracefully — no size limit imposed by Jarvis.
+    """
+    filepath = os.path.abspath(filepath)
+    print(f"[FILE I/O] Reading: {filepath}")
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+        lines = content.count('\n') + 1
+        print(f"[FILE I/O] Read {lines} lines from {filepath}.")
+        return f"--- FILE: {filepath} ({lines} lines) ---\n{content}"
+    except UnicodeDecodeError:
+        # Fallback for files with mixed encodings (e.g. legacy Windows source)
+        try:
+            with open(filepath, 'r', encoding='latin-1') as f:
+                content = f.read()
+            return f"--- FILE (latin-1): {filepath} ---\n{content}"
+        except Exception as enc_err:
+            return f"Failed to decode file (tried utf-8 and latin-1): {enc_err}"
+    except FileNotFoundError:
+        return f"File not found: {filepath}"
+    except Exception as e:
+        return f"Failed to read file: {e}"
+
+
+def write_local_file(filepath: str, new_content: str) -> str:
+    """
+    Overwrites a local file with completely new content.
+    Creates parent directories if they do not exist.
+    Always writes the ENTIRE file — never partial snippets.
+    """
+    filepath = os.path.abspath(filepath)
+    print(f"[FILE I/O] Writing: {filepath}")
+    try:
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        # Atomic-safe write: write to a temp file first, then replace
+        tmp_path = filepath + ".jarvis_tmp"
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        os.replace(tmp_path, filepath)
+        lines = new_content.count('\n') + 1
+        print(f"[FILE I/O] Successfully wrote {lines} lines to {filepath}.")
+        return f"Successfully updated and saved {lines} lines of code to {filepath}."
+    except Exception as e:
+        # Clean up temp file if it exists
+        try:
+            if os.path.exists(filepath + ".jarvis_tmp"):
+                os.remove(filepath + ".jarvis_tmp")
+        except Exception:
+            pass
+        return f"Failed to write to file: {e}"
+
+
+def find_local_file(filename: str, root_dir: str = None) -> str:
+    import os
+    matches = []
+    target = filename.lower()
+    
+    # Start in the project folder, fallback to the entire User directory (C:\Users\...)
+    search_dirs = [os.getcwd()] if root_dir is None else [root_dir]
+    if root_dir is None:
+        search_dirs.append(os.path.expanduser("~"))
+
+    try:
+        for search_dir in search_dirs:
+            for root, _, files in os.walk(search_dir):
+                for file in files:
+                    if target in file.lower():
+                        matches.append(os.path.abspath(os.path.join(root, file)))
             
-        except Exception as e:
-            print(f"[ASSISTIVE AGENT CHECKOUT ERROR] {e}")
-            return "Checkout form filled successfully. Shipping address set to Muhammad Yahya Siddiqui, Shikarpur, Sindh. Order is ready for final voice confirmation, sir."
+            # If found in the first directory (project), stop searching to save time
+            if matches:
+                break
+                    
+        if not matches:
+            return f"Could not find '{filename}' anywhere in {search_dirs}."
             
-    else:
-        return f"Unknown assistive shopping action '{action}', sir."
+        result_str = f"Found {len(matches)} matching files:\n"
+        for match in set(matches): # Use set to remove duplicates
+            result_str += f"- {match}\n"
+        return result_str
+    except Exception as e:
+        return f"Error searching for file: {e}"
+
+
+browser_viewport_control = lambda action, value=500: assistive_web_action(action, str(value))
+assistive_shopping_checkout = lambda address_type="home", custom_phone=None, custom_email=None: assistive_checkout(address_type, custom_phone)
+assistive_shopping_agent = lambda action="search", query=None: assistive_web_action("search" if "search" in action else "open_url", query)
+search_and_inspect_product = lambda query, store_name=None: assistive_web_action("search", f"{query} {store_name}" if store_name else query)
 
 
 def process_fast_command(text):

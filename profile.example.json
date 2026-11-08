@@ -1,0 +1,22 @@
+{
+  "name": "Your Full Name",
+  "first_name": "First",
+  "last_name": "Last",
+  "default_phone": "03XXXXXXXXX",
+  "email": "you@example.com",
+  "weather_city": "Your City, Province",
+  "addresses": {
+    "home": {
+      "label": "Home",
+      "address": "Street, Area, City",
+      "city": "City",
+      "province": "Province"
+    },
+    "hostel": {
+      "label": "Hostel",
+      "address": "Hostel name, University, City",
+      "city": "City",
+      "province": "Province"
+    }
+  }
+}

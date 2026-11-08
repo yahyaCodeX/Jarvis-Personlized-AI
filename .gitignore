@@ -15,3 +15,17 @@ audio_cache/
 screenshot_*.png
 *.wav
 
+
+# Personal data & secrets (see profile.example.json)
+profile.json
+.env.*
+!.env.example
+
+# Voice biometric baseline (your voiceprint)
+auth/owner_voice.wav
+
+# Folders/files created at runtime by Jarvis tools
+Desktop/
+Downloads/
+*.jarvis_tmp
+.pytest_cache/

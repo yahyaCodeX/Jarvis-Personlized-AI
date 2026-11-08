@@ -8,6 +8,12 @@ import commands
 
 class TestCommands(unittest.TestCase):
 
+    def setUp(self):
+        # Reset module-level throttles/caches so tests don't leak state into each other
+        commands._last_attendance_time = 0
+        commands._attendance_cache_result = None
+        commands._attendance_cache_timestamp = 0
+
     # ─── Time & Date Tests ──────────────────────────────────────────
     @patch('commands.datetime')
     def test_get_time_am(self, mock_datetime):
@@ -69,8 +75,9 @@ class TestCommands(unittest.TestCase):
         mock_response.text = "Clear, +35°C, feels like +38°C, humidity 60%"
         mock_get.return_value = mock_response
 
-        res = commands.get_weather()
-        expected = "Shikarpur right now: Clear, +35 degrees Celsius, feels like +38 degrees Celsius, humidity 60%, sir."
+        with patch('commands.WEATHER_CITY', "Testville, Sindh"):
+            res = commands.get_weather()
+        expected = "Testville right now: Clear, +35 degrees Celsius, feels like +38 degrees Celsius, humidity 60%, sir."
         self.assertEqual(res, expected)
 
     @patch('commands.requests.get')
@@ -253,11 +260,21 @@ class TestCommands(unittest.TestCase):
         self.assertIn("Drive D has 150.0 GB free", res)
         self.assertIn("Battery is at 85%", res)
 
-    @patch('commands.webbrowser.open')
-    def test_play_on_youtube(self, mock_web_open):
-        res = commands.handle_command("play logic on youtube")
-        self.assertEqual(res, "Searching YouTube for logic.")
-        mock_web_open.assert_called_once_with("https://www.youtube.com/results?search_query=logic")
+    def test_play_on_youtube(self):
+        fake_pywhatkit = MagicMock()
+        with patch.dict('sys.modules', {'pywhatkit': fake_pywhatkit}):
+            res = commands.handle_command("play logic on youtube")
+        self.assertEqual(res, "Playing 'logic' on YouTube now, sir.")
+        fake_pywhatkit.playonyt.assert_called_once_with("logic")
+
+    @patch('commands.force_open_browser')
+    def test_play_on_youtube_fallback(self, mock_force_open):
+        fake_pywhatkit = MagicMock()
+        fake_pywhatkit.playonyt.side_effect = Exception("no network")
+        with patch.dict('sys.modules', {'pywhatkit': fake_pywhatkit}):
+            res = commands.handle_command("play logic on youtube")
+        self.assertEqual(res, "Searching YouTube for logic, sir.")
+        mock_force_open.assert_called_once_with("https://www.youtube.com/results?search_query=logic")
 
     @patch('commands.pyperclip.paste')
     def test_read_clipboard(self, mock_paste):
@@ -416,10 +433,12 @@ class TestCommands(unittest.TestCase):
         mock_driver = MagicMock()
         mock_chrome.return_value = mock_driver
         
+        fake_env = {"MIS_CNIC": "00000-0000000-0", "MIS_PASSWORD": "test-password"}
         with patch('commands.WebDriverWait') as mock_wait_cls, \
              patch('commands.Select') as mock_select_cls, \
-             patch('commands.time.sleep') as mock_sleep:
-            
+             patch('commands.time.sleep') as mock_sleep, \
+             patch.dict('os.environ', fake_env):
+
             mock_wait = MagicMock()
             mock_wait_cls.return_value = mock_wait
             
@@ -454,9 +473,9 @@ class TestCommands(unittest.TestCase):
             mock_chrome.assert_called_once()
             mock_driver.get.assert_called_once_with("http://misportal.muet.edu.pk/mis/login.php")
             mock_cnic.clear.assert_called_once()
-            mock_cnic.send_keys.assert_called_once_with("***REMOVED***")
+            mock_cnic.send_keys.assert_called_once_with("00000-0000000-0")
             mock_password.clear.assert_called_once()
-            mock_password.send_keys.assert_called_once_with("***REMOVED***")
+            mock_password.send_keys.assert_called_once_with("test-password")
             mock_submit.click.assert_called_once()
             mock_prov_report.click.assert_called_once()
             mock_ug.click.assert_called_once()

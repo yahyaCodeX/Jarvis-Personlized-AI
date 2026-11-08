@@ -43,7 +43,11 @@ last_generated_doc = None
 last_opened_folder = None
 
 # ─── Config ──────────────────────────────────────────────────
-WEATHER_CITY = "Jamshoro, Sindh"
+# Secrets come from .env, personal data from profile.json (both gitignored).
+from config import get_secret, load_profile
+
+USER_PROFILES = load_profile()
+WEATHER_CITY = USER_PROFILES.get("weather_city") or "Jamshoro, Sindh"
 
 # ─── Time & Date ─────────────────────────────────────────────
 def get_time():
@@ -70,8 +74,9 @@ def get_weather():
             weather_text = weather_text.replace("°C", " degrees Celsius")
             weather_text = weather_text.replace("°F", " degrees Fahrenheit")
             weather_text = weather_text.replace("°", " degrees")
-            return f"Shikarpur right now: {weather_text}, sir."
-        return "Couldn't get the weather for Shikarpur right now, sir."
+            place = WEATHER_CITY.split(",")[0].strip()
+            return f"{place} right now: {weather_text}, sir."
+        return "Couldn't get the weather right now, sir."
     except requests.Timeout:
         return "Weather request timed out. Try again in a moment, sir."
     except Exception:
@@ -100,6 +105,7 @@ _APPS = {
     "cmd":           "start cmd",
     "command prompt":"start cmd",
     "terminal":      "start cmd",
+    "portfolio site": "start https://yahyasiddiqui.me",
 }
 
 def open_app(text):
@@ -514,6 +520,11 @@ def fetch_ug_attendance():
         return "I am already logging into the MIS portal for your attendance, sir."
     _last_attendance_time = now
 
+    mis_cnic = get_secret("MIS_CNIC")
+    mis_password = get_secret("MIS_PASSWORD")
+    if not mis_cnic or not mis_password:
+        return "MIS login details are missing, sir. Add MIS_CNIC and MIS_PASSWORD to the .env file."
+
     try:
         options = webdriver.ChromeOptions()
         options.add_experimental_option("detach", True)
@@ -532,9 +543,9 @@ def fetch_ug_attendance():
         submit_btn = driver.find_element(By.ID, "studentLogin")
         
         cnic_input.clear()
-        cnic_input.send_keys("***REMOVED***")
+        cnic_input.send_keys(mis_cnic)
         password_input.clear()
-        password_input.send_keys("***REMOVED***")
+        password_input.send_keys(mis_password)
         submit_btn.click()
         
         # b) Locate the sidebar menu item "Provisional Report" and click it
@@ -1109,25 +1120,7 @@ def open_local_folder(target_path: str) -> str:
 
 
 # ─── USER PROFILES FOR ASSISTIVE E-COMMERCE (SDG 10) ───────────────
-USER_PROFILES = {
-    "name": "Muhammad Yahya Siddiqui",
-    "first_name": "Muhammad Yahya",
-    "last_name": "Siddiqui",
-    "default_phone": "***REMOVED***",
-    "email": "***REMOVED***",
-    "addresses": {
-        "home": {
-            "address": "***REMOVED***",
-            "city": "Shikarpur",
-            "province": "Sindh",
-        },
-        "hostel": {
-            "address": "***REMOVED***",
-            "city": "Jamshoro",
-            "province": "Sindh",
-        },
-    },
-}
+# USER_PROFILES is loaded from profile.json at the top of this module.
 
 
 def assistive_checkout(address_choice: str = "home", custom_phone: str = None) -> str:
@@ -1136,13 +1129,17 @@ def assistive_checkout(address_choice: str = "home", custom_phone: str = None) -
     Dynamically extracts visible form fields from ANY e-commerce checkout page,
     uses Gemini LLM to map user profile data to the form inputs, and fills them via Playwright.
     """
-    addr_type = (address_choice or "home").lower().strip()
-    if addr_type not in ["home", "hostel"]:
-        addr_type = "home"
+    addresses = USER_PROFILES.get("addresses") or {}
+    if not addresses:
+        return "No saved addresses found, sir. Add them to profile.json first."
 
-    target_profile = USER_PROFILES["addresses"][addr_type]
-    target_address = target_profile["address"]
-    city_name = "Jamshoro" if addr_type == "hostel" else "Shikarpur"
+    addr_type = (address_choice or "home").lower().strip()
+    if addr_type not in addresses:
+        addr_type = "home" if "home" in addresses else next(iter(addresses))
+
+    target_profile = addresses[addr_type]
+    target_address = target_profile.get("address", "")
+    city_name = target_profile.get("city", "")
     phone_val = custom_phone.strip() if custom_phone and custom_phone.strip() else USER_PROFILES["default_phone"]
     selected_email = USER_PROFILES["email"]
 
@@ -1154,7 +1151,7 @@ def assistive_checkout(address_choice: str = "home", custom_phone: str = None) -
         "phone": phone_val,
         "address": target_address,
         "city": city_name,
-        "province": "Sindh"
+        "province": target_profile.get("province", ""),
     }
 
     try:

@@ -40,8 +40,11 @@
    pip install -r requirements.txt
    ```
 
-3. **Configure Environment Variables**
-   Create a `.env` file in the root directory and add your required API keys (e.g., Gemini API key).
+3. **Configure secrets and your profile** (both files are gitignored, never commit them)
+   ```bash
+   copy .env.example .env                    # then fill in GEMINI_API_KEY, MIS_CNIC, MIS_PASSWORD
+   copy profile.example.json profile.json    # then fill in your name, phone, addresses, city
+   ```
 
 4. **Run Jarvis**
    ```bash

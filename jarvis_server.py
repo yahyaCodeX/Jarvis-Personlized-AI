@@ -57,8 +57,16 @@ from commands import (
     remember_fact,
     get_all_memories,
 )
+from config import load_profile
 
 load_dotenv()
+
+# Personal data comes from profile.json (gitignored) — never hardcode it here.
+PROFILE = load_profile()
+_ADDRESS_CHOICES = ", ".join(
+    f"'{key}' ({addr.get('city', key)})"
+    for key, addr in (PROFILE.get("addresses") or {}).items()
+) or "'home'"
 
 # ============================================================
 #  Audio constants
@@ -315,7 +323,7 @@ async def run_gemini_live() -> None:
         "1. Use `assistive_web_action` to search web ('search'), open URLs ('open_url'), select search result by rank ('click_result' with target '1', '2', '3'), scroll pages down/up ('scroll_down'/'scroll_up'), or click text elements ('click_text').\n"
         "2. When the user asks to open the 1st, 2nd, or 3rd search result or site, invoke `assistive_web_action` with `action: 'click_result'` and `target: '1'`, `'2'`, or `'3'`.\n"
         "3. If the user asks for prices or text on screen, invoke `analyze_active_screen`.\n"
-        "4. Use `assistive_checkout` ONLY when the user is already on a checkout page and verbally confirms the address choice ('home' for Shikarpur or 'hostel' for Jamshoro) and phone number.\n\n"
+        f"4. Use `assistive_checkout` ONLY when the user is already on a checkout page and verbally confirms the address choice ({_ADDRESS_CHOICES}) and phone number.\n\n"
         "E-COMMERCE NAVIGATION PROTOCOL (CRITICAL — follow exactly):\n"
         "When the user says 'open the first item', 'click the second product', 'open that phone', or any ordinal product reference on a store page:\n"
         "  Step 1: IMMEDIATELY call `analyze_active_screen` to visually read the exact product name shown on screen (e.g., 'Vivo V80 Lite 5G', 'Nike Air Max 270').\n"
@@ -373,12 +381,12 @@ async def run_gemini_live() -> None:
                 },
                 {
                     "name": "assistive_checkout",
-                    "description": "Injects predefined shipping & checkout details into the currently open active browser page after user verbally confirms address choice ('home' for Shikarpur or 'hostel' for Jamshoro) and contact phone number.",
+                    "description": f"Injects the user's saved shipping & checkout details into the currently open browser page after the user verbally confirms the address choice ({_ADDRESS_CHOICES}) and contact phone number.",
                     "parameters": {
                         "type": "OBJECT",
                         "properties": {
-                            "address_choice": {"type": "STRING", "description": "'home' (***REMOVED***) or 'hostel' (***REMOVED***)"},
-                            "custom_phone":   {"type": "STRING", "description": "Optional phone number if different from default ***REMOVED***"},
+                            "address_choice": {"type": "STRING", "description": f"Saved address key: {_ADDRESS_CHOICES}"},
+                            "custom_phone":   {"type": "STRING", "description": "Optional phone number if different from the user's saved default"},
                         },
                         "required": ["address_choice"],
                     },

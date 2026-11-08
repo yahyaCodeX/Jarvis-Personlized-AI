@@ -45,10 +45,10 @@ class _JarvisDashboardState extends State<JarvisDashboard>
   String _recognizedUser = 'TAB & TECH';
   double _audioLevel = 0.5;
 
-  double _cpuLoad = 0.42;
-  double _ramLoad = 0.55;
-  double _gpuLoad = 0.78;
-  double _latency = 0.12;
+  double _cpuLoad = 0.0;
+  double _ramLoad = 0.0;
+  double? _gpuLoad; // null = no GPU data (shown as N/A)
+  double? _latencyMs; // end of speech -> first reply audio
 
   final List<Map<String, String>> _terminalLogs = [
     {'type': 'sys', 'msg': 'SYSTEM BOOT: J.A.R.V.I.S OS v3.5 ONLINE'},
@@ -127,8 +127,8 @@ class _JarvisDashboardState extends State<JarvisDashboard>
               setState(() {
                 if (data['cpu'] != null) _cpuLoad = (data['cpu'] as num).toDouble() / 100.0;
                 if (data['ram'] != null) _ramLoad = (data['ram'] as num).toDouble() / 100.0;
-                if (data['gpu'] != null) _gpuLoad = (data['gpu'] as num).toDouble() / 100.0;
-                if (data['latency'] != null) _latency = (data['latency'] as num).toDouble() / 100.0;
+                _gpuLoad = data['gpu'] == null ? null : (data['gpu'] as num).toDouble() / 100.0;
+                if (data['latency'] != null) _latencyMs = (data['latency'] as num).toDouble();
               });
             }
             if (data['audio_level'] != null) {
@@ -576,8 +576,10 @@ class _JarvisDashboardState extends State<JarvisDashboard>
             const SizedBox(height: 8),
             _buildTelemetryBar('CPU CORE LOAD', _cpuLoad, const Color(0xFF00E5FF)),
             _buildTelemetryBar('NEURAL MEMORY', _ramLoad, const Color(0xFFA855F7)),
-            _buildTelemetryBar('GPU ACCELERATION', _gpuLoad, const Color(0xFF00FF66)),
-            _buildTelemetryBar('LATENCY (MS)', _latency, const Color(0xFFFFB703)),
+            _buildTelemetryBar('GPU ACCELERATION', _gpuLoad ?? 0.0, const Color(0xFF00FF66),
+                display: _gpuLoad == null ? 'N/A' : null),
+            _buildTelemetryBar('RESPONSE LATENCY', (_latencyMs ?? 0.0) / 3000.0, const Color(0xFFFFB703),
+                display: _latencyMs == null ? '--' : '${_latencyMs!.toInt()} ms'),
             const Divider(color: Color(0xFF1E293B), height: 16),
             _buildSectionHeader('SIMULATE STATES', Icons.tune),
             const SizedBox(height: 6),
@@ -814,7 +816,7 @@ class _JarvisDashboardState extends State<JarvisDashboard>
     );
   }
 
-  Widget _buildTelemetryBar(String label, double val, Color color) {
+  Widget _buildTelemetryBar(String label, double val, Color color, {String? display}) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 5),
       child: Column(
@@ -826,7 +828,7 @@ class _JarvisDashboardState extends State<JarvisDashboard>
               Text(label,
                   style: const TextStyle(
                       color: Color(0xFF64748B), fontSize: 9)),
-              Text('${(val * 100).toInt()}%',
+              Text(display ?? '${(val * 100).toInt()}%',
                   style: TextStyle(
                       color: color,
                       fontSize: 9,

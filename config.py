@@ -33,6 +33,25 @@ def get_secret(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def _model_list(env_name: str, default: str) -> list[str]:
+    raw = os.getenv(env_name, "") or default
+    return [m.strip() for m in raw.split(",") if m.strip()]
+
+
+# ── Gemini models (override in .env as comma-separated lists, first = preferred) ──
+# Realtime voice models (must support the Live / bidiGenerateContent API)
+LIVE_MODELS = _model_list(
+    "JARVIS_LIVE_MODELS",
+    # Verified 2026-11-08 against this project's full tool config.
+    "gemini-3.8-live,gemini-3.1-flash-live-preview,gemini-2.5-flash-native-audio-latest",
+)
+# Fast text + vision models (screen reading, Ghost Coder, checkout field mapping)
+VISION_MODELS = _model_list(
+    "JARVIS_VISION_MODELS",
+    "gemini-3.8-flash,gemini-3.6-flash,gemini-flash-latest",
+)
+
+
 def load_profile() -> dict:
     """Load the user's personal profile from profile.json (empty profile if missing)."""
     try:

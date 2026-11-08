@@ -56,8 +56,11 @@ from commands import (
     search_maps,
     remember_fact,
     get_all_memories,
+    browser_tab_control,
+    page_scroll,
+    site_interaction,
 )
-from config import load_profile, get_secret
+from config import load_profile, get_secret, LIVE_MODELS
 from safety import gate, confirmation_required, check_path
 import re
 
@@ -112,6 +115,9 @@ tools_map = {
     "search_google":           search_google,
     "search_maps":             search_maps,
     "remember_fact":           remember_fact,
+    "browser_tab_control":     browser_tab_control,
+    "page_scroll":             page_scroll,
+    "site_interaction":        site_interaction,
 }
 
 connected_clients:  set            = set()
@@ -125,7 +131,11 @@ _active_mic_stop_event: threading.Event = None  # type: ignore
 _active_mic_thread:     threading.Thread = None  # type: ignore
 
 _tool_lock             = asyncio.Lock()
-_last_tool_timestamps: dict = {}
+_last_tool_timestamps: dict = {}   # (tool name, args) -> last call time
+TOOL_DEDUPE_SECONDS    = 3.0
+
+_live_task: asyncio.Task | None = None   # the running run_gemini_live() task
+_last_latency_ms: float | None = None    # end of user speech -> first reply audio
 
 
 # ============================================================
@@ -226,12 +236,16 @@ async def _run_tool(name: str, args: dict) -> str:
 
 
 async def execute_tool_safely(name: str, args: dict) -> str:
+    # Skip only *identical* repeated calls (same tool + same args) fired within a
+    # few seconds — Gemini sometimes emits duplicates. Different args, or the
+    # same command a few seconds later ("scroll down" again), always run.
     now = time.time()
     if name not in _NO_DEBOUNCE:
-        if now - _last_tool_timestamps.get(name, 0) < 8.0:
-            print(f"[TOOL DEBOUNCE] Skipped duplicate '{name}'")
-            return f"'{name}' already running, sir."
-        _last_tool_timestamps[name] = now
+        key = (name, json.dumps(args, sort_keys=True, default=str))
+        if now - _last_tool_timestamps.get(key, 0) < TOOL_DEDUPE_SECONDS:
+            print(f"[TOOL DEDUPE] Skipped duplicate '{name}' {args}")
+            return f"'{name}' was just run with the same arguments, sir."
+        _last_tool_timestamps[key] = now
 
     async with _tool_lock:
         # ── Step 2 of a sensitive action: the user has (maybe) answered ──────
@@ -265,15 +279,45 @@ async def execute_tool_safely(name: str, args: dict) -> str:
 #  System telemetry
 # ============================================================
 
+_nvidia_smi_available = True
+
+
+def _read_gpu_percent() -> float | None:
+    """GPU utilisation via nvidia-smi (None if no NVIDIA GPU / driver)."""
+    global _nvidia_smi_available
+    if not _nvidia_smi_available:
+        return None
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        values = [float(v) for v in out.stdout.split() if v.strip()]
+        return max(values) if values else None
+    except (FileNotFoundError, OSError):
+        _nvidia_smi_available = False   # don't keep trying every second
+        return None
+    except Exception:
+        return None
+
+
 async def telemetry_loop() -> None:
+    psutil.cpu_percent()  # first call always returns 0 — prime it
+    tick = 0
+    gpu: float | None = None
     while True:
         if connected_clients:
+            if tick % 3 == 0:  # nvidia-smi costs ~100 ms, sample every 3 s
+                gpu = await asyncio.to_thread(_read_gpu_percent)
             await broadcast("telemetry", {
                 "cpu":     psutil.cpu_percent(),
                 "ram":     psutil.virtual_memory().percent,
-                "gpu":     78.0,
-                "latency": 12,
+                "gpu":     gpu,                 # None → HUD shows N/A
+                "latency": _last_latency_ms,    # ms, None until first reply
             })
+        tick += 1
         await asyncio.sleep(1.0)
 
 
@@ -370,20 +414,8 @@ def _mic_capture_thread(
 #  Gemini Live Engine
 # ============================================================
 
-async def run_gemini_live() -> None:
-    global session_running, audio_out_queue, is_jarvis_speaking
-
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        msg = "GEMINI_API_KEY not found in .env!"
-        print(f"[CRITICAL] {msg}")
-        await broadcast("status", {"state": "alert", "message": msg})
-        session_running = False
-        return
-
-    client   = genai.Client(api_key=api_key, http_options={"api_version": "v1alpha"})
-    model_id = "gemini-2.0-flash-exp"
-
+def build_live_config() -> types.LiveConnectConfig:
+    """Build the system prompt (with saved memories) and the full Gemini Live config."""
     memories      = get_all_memories()
     system_prompt = (
         "You are J.A.R.V.I.S, an advanced AI operating system.\n"
@@ -426,6 +458,11 @@ async def run_gemini_live() -> None:
         # Transcribe the USER's mic audio — used by the confirmation gate
         # (and available for a live transcript in the HUD).
         input_audio_transcription=types.AudioTranscriptionConfig(),
+        # Long conversations: drop the oldest turns instead of hitting the
+        # context limit and getting disconnected.
+        context_window_compression=types.ContextWindowCompressionConfig(
+            sliding_window=types.SlidingWindow(),
+        ),
         speech_config=types.SpeechConfig(
             voice_config=types.VoiceConfig(
                 prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Fenrir")
@@ -678,6 +715,22 @@ async def run_gemini_live() -> None:
             ]
         }],
     )
+    return config
+
+
+async def run_gemini_live() -> None:
+    global session_running, audio_out_queue, is_jarvis_speaking
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        msg = "GEMINI_API_KEY not found in .env!"
+        print(f"[CRITICAL] {msg}")
+        await broadcast("status", {"state": "alert", "message": msg})
+        session_running = False
+        return
+
+    client   = genai.Client(api_key=api_key, http_options={"api_version": "v1alpha"})
+    config = build_live_config()
 
     audio_out_queue = asyncio.Queue()
 
@@ -803,17 +856,35 @@ async def run_gemini_live() -> None:
             spk.close()
             pa_out.terminate()
 
+    # ── Session resumption state (survives reconnects within this run) ───────
+    # Gemini sends a fresh handle periodically; reconnecting with it restores
+    # the conversation instead of starting from scratch.
+    resume: dict = {"handle": None}
+
     # ── receiver_worker ──────────────────────────────────────────────────────
     async def receiver_worker(session) -> None:
-        global is_jarvis_speaking
+        global is_jarvis_speaking, _last_latency_ms
         recv_n        = 0
         last_recv_log = time.time()
+        last_user_speech_ts: float | None = None   # for latency measurement
         print("[RECEIVER] Worker started — waiting for Gemini responses...")
 
         while session_running:
             try:
+                got_any = False
                 async for resp in session.receive():
+                    got_any = True
                     recv_n += 1
+
+                    # Save the latest resumption handle for seamless reconnects
+                    upd = resp.session_resumption_update
+                    if upd and upd.resumable and upd.new_handle:
+                        resume["handle"] = upd.new_handle
+
+                    # Server is about to close this connection (session time limit)
+                    if resp.go_away:
+                        print(f"[GEMINI] GoAway received (time left: {resp.go_away.time_left}) — reconnecting with resume handle.")
+                        return
 
                     # Heartbeat: warn if nothing received for >15 seconds
                     now = time.time()
@@ -839,6 +910,7 @@ async def run_gemini_live() -> None:
                     # User's own speech transcript → confirmation gate + HUD
                     if sc and sc.input_transcription and sc.input_transcription.text:
                         heard = sc.input_transcription.text
+                        last_user_speech_ts = time.time()
                         gate.record_user_speech(heard)
                         await broadcast("transcript", {"role": "user", "text": heard})
 
@@ -857,6 +929,9 @@ async def run_gemini_live() -> None:
                     if sc and sc.model_turn:
                         for p in sc.model_turn.parts:
                             if p.inline_data:
+                                if last_user_speech_ts is not None:
+                                    _last_latency_ms = round((time.time() - last_user_speech_ts) * 1000)
+                                    last_user_speech_ts = None
                                 await audio_out_queue.put(p.inline_data.data)
                             if p.text:
                                 await broadcast("status", {"state": "speaking", "message": p.text})
@@ -886,76 +961,106 @@ async def run_gemini_live() -> None:
                                 ]
                             )
 
+                if not got_any:
+                    # receive() ended without yielding anything: socket is gone
+                    print("[RECEIVER CLOSED] Stream ended.")
+                    return
+
             except Exception as exc:
                 print(f"[RECEIVER CLOSED] Connection closed: {exc}")
                 return
 
     # ── Auto-Reconnect Connection Loop ───────────────────────────────────────
-    models_to_try = [
-        "gemini-2.0-flash-exp",
-        "gemini-3.1-flash-live-preview",
-    ]
-    model_idx = 0
+    models_to_try = list(LIVE_MODELS)
+    model_idx     = 0
+    backoff_s     = 2.0
+    greeted       = False
+
+    async def run_workers(session) -> None:
+        """Run the 3 workers; as soon as ANY of them exits, cancel the others
+        so the outer loop can reconnect (gather() would wait forever on the
+        speaker worker, which is blocked on an empty queue)."""
+        tasks = {
+            asyncio.create_task(mic_worker(session),      name="mic_worker"),
+            asyncio.create_task(speaker_worker(),         name="speaker_worker"),
+            asyncio.create_task(receiver_worker(session), name="receiver_worker"),
+        }
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                exc = t.exception() if not t.cancelled() else None
+                print(f"[WORKER EXIT] {t.get_name()}" + (f": {exc}" if exc else ""))
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     try:
         while session_running:
             current_model = models_to_try[model_idx % len(models_to_try)]
-            print(f"[GEMINI] Connecting to {current_model}...")
+            handle = resume["handle"]
+            print(f"[GEMINI] Connecting to {current_model}" + (" (resuming previous session)" if handle else "") + "...")
+            session_config = config.model_copy(update={
+                "session_resumption": types.SessionResumptionConfig(handle=handle),
+            })
+            connected_at = None
 
             try:
-                async with client.aio.live.connect(model=current_model, config=config) as session:
+                async with client.aio.live.connect(model=current_model, config=session_config) as session:
+                    connected_at = time.time()
                     print(f"[GEMINI] Connected to {current_model} successfully!")
+                    await broadcast("status", {"state": "listening", "message": "Listening..."})
 
-                    # ── Trigger initial session greeting via send_client_content ──────
-                    try:
-                        print("[GEMINI] Triggering opening spoken greeting...")
-                        await session.send_client_content(
-                            turns=[
-                                types.Content(
-                                    role="user",
-                                    parts=[
-                                        types.Part.from_text(
-                                            text="Greetings Jarvis! Say: J.A.R.V.I.S duplex engine is online and ready, sir."
-                                        )
-                                    ],
-                                )
-                            ],
-                            turn_complete=True,
-                        )
-                    except Exception as greeting_err:
-                        print(f"[GEMINI] Initial greeting warning: {greeting_err}")
+                    # Drop audio captured while we were disconnected
+                    while not mic_queue.empty():
+                        mic_queue.get_nowait()
+                        mic_queue.task_done()
 
-                    results = await asyncio.gather(
-                        mic_worker(session),
-                        speaker_worker(),
-                        receiver_worker(session),
-                        return_exceptions=True,
-                    )
+                    # Spoken greeting — only on the very first connection
+                    if not greeted and not handle:
+                        greeted = True
+                        try:
+                            await session.send_client_content(
+                                turns=[types.Content(role="user", parts=[types.Part.from_text(
+                                    text="Greet me in one short sentence: say the J.A.R.V.I.S duplex engine is online and ready."
+                                )])],
+                                turn_complete=True,
+                            )
+                        except Exception as greeting_err:
+                            print(f"[GEMINI] Initial greeting warning: {greeting_err}")
 
-                    for wname, result in zip(
-                        ["mic_worker", "speaker_worker", "receiver_worker"], results
-                    ):
-                        if isinstance(result, Exception):
-                            print(f"[WORKER EXIT] {wname}: {result}")
+                    await run_workers(session)
 
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                err_str = str(exc)
+                err_str = str(exc).lower()
                 print(f"[GEMINI SESSION DISCONNECTED] {exc}")
-                if "1008" in err_str or "not found" in err_str.lower():
+                if resume["handle"] and ("handle" in err_str or "resum" in err_str or "invalid" in err_str):
+                    print("[GEMINI] Resume handle rejected — starting a fresh session.")
+                    resume["handle"] = None
+                elif any(k in err_str for k in ("1008", "not found", "not supported", "404", "permission")):
                     model_idx += 1
-                    print(f"[GEMINI] Fallback switching to model: {models_to_try[model_idx % len(models_to_try)]}")
+                    resume["handle"] = None  # handles are model-specific
+                    print(f"[GEMINI] Model unavailable — falling back to {models_to_try[model_idx % len(models_to_try)]}")
 
-            if session_running:
-                print("[GEMINI] Reconnecting in 2 seconds...")
-                await broadcast("status", {"state": "idle", "message": "Reconnecting to Gemini Live..."})
-                await asyncio.sleep(2.0)
+            if not session_running:
+                break
+
+            # A session that lived a while was healthy — reset the backoff
+            if connected_at and time.time() - connected_at > 30:
+                backoff_s = 2.0
+            print(f"[GEMINI] Reconnecting in {backoff_s:.0f} seconds...")
+            await broadcast("status", {"state": "idle", "message": "Reconnecting to Gemini Live..."})
+            await asyncio.sleep(backoff_s)
+            backoff_s = min(backoff_s * 2, 30.0)
 
     finally:
         # Signal the background thread to stop
         stop_event.set()
         session_running    = False
         is_jarvis_speaking = False
-        mic_thread.join(timeout=3.0)
+        await asyncio.to_thread(mic_thread.join, 3.0)   # don't block the event loop
         print("[MIC THREAD] Joined.")
 
 
@@ -980,7 +1085,7 @@ def _verify_owner_voice() -> bool:
 
 
 async def handler(websocket) -> None:
-    global session_running
+    global session_running, _live_task
     connected_clients.add(websocket)
     print(f"[WS] Flutter connected: {websocket.remote_address}")
 
@@ -992,10 +1097,18 @@ async def handler(websocket) -> None:
 
     try:
         async for raw in websocket:
-            payload = json.loads(raw)
-            cmd     = payload.get("command")
+            try:
+                payload = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                print(f"[WS] Ignoring malformed message: {str(raw)[:80]}")
+                continue
+            cmd = payload.get("command") if isinstance(payload, dict) else None
 
             if cmd == "initialize" and not session_running:
+                # Make sure a previous session has fully shut down first
+                if _live_task and not _live_task.done():
+                    _live_task.cancel()
+                    await asyncio.wait([_live_task], timeout=5)
                 session_running = True
                 await broadcast("status", {
                     "state":   "face_scanning",
@@ -1018,18 +1131,15 @@ async def handler(websocket) -> None:
                         await asyncio.to_thread(speak_tts, "Voice verification failed. Access denied.")
                         continue
                     await broadcast("status", {"state": "listening", "message": "Voice verified."})
-                await asyncio.to_thread(
-                    speak_tts,
-                    "Greetings, sir. J.A.R.V.I.S Duplex Engine is online and ready.",
-                )
+                # (No SAPI greeting here — Gemini speaks the greeting once connected.)
                 await broadcast("status", {
                     "state":   "listening",
                     "user":    "TAB & TECH",
                     "message": "Launching Gemini Live Duplex...",
                 })
 
-                task = asyncio.create_task(run_gemini_live())
-                task.add_done_callback(
+                _live_task = asyncio.create_task(run_gemini_live())
+                _live_task.add_done_callback(
                     lambda t: (
                         print(f"[TASK ERROR] run_gemini_live: {t.exception()}")
                         if not t.cancelled() and t.exception()
@@ -1045,6 +1155,11 @@ async def handler(websocket) -> None:
 
             elif cmd == "stop":
                 session_running = False
+                # Cancel the live task: workers are blocked on queue.get(), so
+                # flipping the flag alone never stopped them (mic kept recording).
+                if _live_task and not _live_task.done():
+                    _live_task.cancel()
+                    await asyncio.wait([_live_task], timeout=5)
                 await broadcast("status", {"state": "idle", "message": "Session terminated."})
                 await asyncio.to_thread(speak_tts, "Session terminated.")
 

@@ -44,7 +44,7 @@ last_opened_folder = None
 
 # ─── Config ──────────────────────────────────────────────────
 # Secrets come from .env, personal data from profile.json (both gitignored).
-from config import get_secret, load_profile
+from config import get_secret, load_profile, VISION_MODELS
 from safety import check_path, allowed_dirs
 import shutil
 
@@ -1214,7 +1214,7 @@ Rules:
 - Output MUST be a valid JSON object where key is the field 'name' or 'id' (prefer 'name', fallback to 'id'), and value is the exact string from User Profile Data.
 - Do NOT output extra text or explanations outside JSON.
 """
-                models_to_try = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-3.6-flash"]
+                models_to_try = VISION_MODELS
                 raw_response = ""
 
                 for model_name in models_to_try:
@@ -1331,7 +1331,7 @@ def analyze_active_screen(query: str = None) -> str:
         )
 
         response = None
-        vision_models = ["gemini-3.6-flash", "gemini-flash-latest"]
+        vision_models = VISION_MODELS
         for vmodel in vision_models:
             try:
                 response = client.models.generate_content(
@@ -1408,7 +1408,7 @@ def debug_active_screen_code(issue_hint: str = None) -> str:
         )
 
         # Try vision-capable Gemini models in order of preference
-        vision_models = ["gemini-3.6-flash", "gemini-flash-latest"]
+        vision_models = VISION_MODELS
         for vmodel in vision_models:
             try:
                 response = client.models.generate_content(

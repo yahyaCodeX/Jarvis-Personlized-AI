@@ -10,7 +10,7 @@ def enroll():
     
     recognizer = sr.Recognizer()
     
-    # Try using MIC_DEVICE_INDEX 1 (as configured in brain.py), fallback to default if it fails
+    # Try mic device 1 (same as MIC_DEVICE_INDEX in jarvis_server.py), fallback to default if it fails
     mic_index = 1
     try:
         source = sr.Microphone(device_index=mic_index)

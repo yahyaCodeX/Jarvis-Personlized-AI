@@ -97,10 +97,16 @@ class TestConfirmationGate(unittest.TestCase):
         self.gate.record_user_speech("confirm")
         self.assertFalse(self.gate.resolve("bogus")[0])
 
-    def test_ui_approval(self):
-        tok = self.gate.request("assistive_checkout", {}, "fill checkout")
-        self.assertEqual(self.gate.approve_latest_from_ui(), tok)
-        self.assertTrue(self.gate.resolve(tok)[0])
+    def test_pop_latest_for_hud_buttons(self):
+        self.gate.request("write_local_file", {}, "older")
+        time.sleep(0.01)
+        tok = self.gate.request("assistive_checkout", {"address_choice": "home"}, "newest")
+        popped_tok, entry = self.gate.pop_latest()
+        self.assertEqual(popped_tok, tok)
+        self.assertEqual(entry["summary"], "newest")
+        self.assertFalse(self.gate.is_pending(tok))
+        self.assertEqual(self.gate.pop_latest()[1]["summary"], "older")
+        self.assertIsNone(self.gate.pop_latest())
 
     def test_expired_request(self):
         tok = self.gate.request("write_local_file", {}, "overwrite x")

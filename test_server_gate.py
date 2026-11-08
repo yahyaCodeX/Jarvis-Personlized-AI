@@ -57,5 +57,42 @@ class TestServerConfirmationFlow(unittest.TestCase):
         self.assertIn("outside", res)
 
 
+class TestHudButtons(TestServerConfirmationFlow):
+    """HUD Confirm/Cancel run (or drop) the pending action and tell Gemini."""
+
+    def setUp(self):
+        super().setUp()
+        self.notes = []
+        notes = self.notes
+
+        class FakeSession:
+            async def send_client_content(self, turns, turn_complete):
+                notes.append(turns[0].parts[0].text)
+
+        p = patch.object(js, "_live_session", FakeSession())
+        p.start()
+        self.patches.append(p)
+
+    def test_hud_confirm_runs_action_and_notifies_model(self):
+        token = self._request_write()
+        asyncio.run(js._resolve_from_hud(approved=True))
+        self.assertEqual(len(self.calls), 1)
+        self.assertFalse(js.gate.is_pending(token))
+        self.assertIn("pressed Confirm", self.notes[0])
+        self.assertIn("written", self.notes[0])
+
+    def test_hud_cancel_drops_action(self):
+        token = self._request_write()
+        asyncio.run(js._resolve_from_hud(approved=False))
+        self.assertEqual(self.calls, [])
+        self.assertFalse(js.gate.is_pending(token))
+        self.assertIn("pressed Cancel", self.notes[0])
+
+    def test_hud_confirm_with_nothing_pending_is_harmless(self):
+        asyncio.run(js._resolve_from_hud(approved=True))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.notes, [])
+
+
 if __name__ == "__main__":
     unittest.main()

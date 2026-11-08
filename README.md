@@ -50,6 +50,7 @@ Settings live in `.env` (see `.env.example`).
 2. **Install dependencies**
    ```bash
    pip install -r requirements.txt
+   playwright install chromium
    ```
 
 3. **Configure secrets and your profile** (both files are gitignored, never commit them)
@@ -58,22 +59,36 @@ Settings live in `.env` (see `.env.example`).
    copy profile.example.json profile.json    # then fill in your name, phone, addresses, city
    ```
 
-4. **Run Jarvis**
+4. **Enroll your voice** (once)
    ```bash
-   start_jarvis.bat
+   python enroll_voice.py
    ```
-   *or*
+
+5. **Build the HUD** (once, needs Flutter)
    ```bash
-   python live_jarvis.py
+   cd jarvis_ui && flutter build windows
+   ```
+
+6. **Run Jarvis:** double-click `start_jarvis.bat`. It opens the HUD and starts the server. Press **INITIALIZE DUPLEX** in the HUD and speak to verify your voice.
+
+7. **Run the tests**
+   ```bash
+   pytest
    ```
 
 ## 📂 Project Structure
 
-- `jarvis_ui/` - User interface components
-- `commands.py` / `actions.py` - Core logic for system and automation commands.
-- `brain.py` / `jarvis_server.py` - AI integration and server endpoints.
-- `enroll_voice.py` - Voice biometric enrollment.
-- `live_jarvis.py` - Main entry point for the assistant.
+| Path | What it does |
+|---|---|
+| `jarvis_server.py` | Main entry point: Gemini Live voice session, tool dispatch, WebSocket bridge to the HUD |
+| `commands.py` | The tools Jarvis can use (browser, files, apps, screen vision, attendance, memory) |
+| `safety.py` | Folder sandbox and spoken-confirmation gate |
+| `config.py` | Loads `.env`, `profile.json`, model names and logging |
+| `personality.txt` | Jarvis's persona and speaking style (edit freely) |
+| `auth/voice_auth.py`, `enroll_voice.py` | Voice biometrics |
+| `jarvis_ui/` | Flutter HUD: status, telemetry, live transcript, Confirm/Cancel |
+| `scripts/` | Mic and audio diagnostics (`list_mic_devices.py`, `mic_levels.py`, `live_audio_check.py`) |
+| `logs/jarvis.log` | Rotating log (set `JARVIS_LOG_LEVEL=DEBUG` for detail) |
 
 ## 🤝 Contributing
 

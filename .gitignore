@@ -29,3 +29,5 @@ Desktop/
 Downloads/
 *.jarvis_tmp
 .pytest_cache/
+logs/
+*.bak

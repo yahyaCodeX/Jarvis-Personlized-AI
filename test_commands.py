@@ -309,7 +309,7 @@ class TestCommands(unittest.TestCase):
     @patch('commands.requests.post')
     @patch('docx.Document')
     @patch('commands.threading.Thread')
-    @patch('brain.speak')
+    @patch('commands.speak')
     def test_generate_university_assignment_success(self, mock_speak, mock_thread, mock_doc_class, mock_post):
         # Mock Ollama API response to yield bytes chunks via iter_lines
         mock_response = MagicMock()

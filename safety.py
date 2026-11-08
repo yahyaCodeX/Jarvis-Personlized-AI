@@ -114,7 +114,6 @@ class ConfirmationGate:
         self._lock = threading.Lock()
         self._pending: dict[str, dict] = {}
         self._speech: list[tuple[float, str]] = []   # (timestamp, user transcript chunk)
-        self._ui_approvals: dict[str, float] = {}    # token -> time approved from the HUD
 
     # ── Inputs from the outside world ────────────────────────────────────────
     def record_user_speech(self, text: str) -> None:
@@ -125,15 +124,19 @@ class ConfirmationGate:
             self._speech.append((time.time(), text))
             self._speech = self._speech[-50:]
 
-    def approve_latest_from_ui(self) -> str | None:
-        """Approve the newest pending action from a trusted UI button (Flutter HUD)."""
+    def pop_latest(self) -> tuple[str, dict] | None:
+        """Remove and return the newest pending action (HUD Confirm/Cancel buttons)."""
         with self._lock:
             self._expire()
             if not self._pending:
                 return None
             token = max(self._pending, key=lambda t: self._pending[t]["created"])
-            self._ui_approvals[token] = time.time()
-            return token
+            return token, self._pending.pop(token)
+
+    def is_pending(self, token: str) -> bool:
+        with self._lock:
+            self._expire()
+            return (token or "").strip() in self._pending
 
     # ── Tool-side API ────────────────────────────────────────────────────────
     def request(self, name: str, args: dict, summary: str) -> str:
@@ -157,11 +160,6 @@ class ConfirmationGate:
             if entry is None:
                 return False, "No pending action with that token (it may have expired). Ask the user again."
 
-            if token in self._ui_approvals:
-                self._pending.pop(token)
-                self._ui_approvals.pop(token, None)
-                return True, entry
-
             heard = " ".join(t for ts, t in self._speech if ts >= entry["created"])
             # Any negative word wins ("don't do it" must never count as approval).
             if _NEGATIVE.search(heard):
@@ -180,7 +178,6 @@ class ConfirmationGate:
         now = time.time()
         for tok in [t for t, e in self._pending.items() if now - e["created"] > CONFIRM_TIMEOUT_S]:
             self._pending.pop(tok, None)
-            self._ui_approvals.pop(tok, None)
 
 
 gate = ConfirmationGate()

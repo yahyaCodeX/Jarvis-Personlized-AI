@@ -49,6 +49,7 @@ class _JarvisDashboardState extends State<JarvisDashboard>
   double _ramLoad = 0.0;
   double? _gpuLoad; // null = no GPU data (shown as N/A)
   double? _latencyMs; // end of speech -> first reply audio
+  Map<String, dynamic>? _pendingConfirm; // sensitive action waiting for approval
 
   final List<Map<String, String>> _terminalLogs = [
     {'type': 'sys', 'msg': 'SYSTEM BOOT: J.A.R.V.I.S OS v3.5 ONLINE'},
@@ -123,6 +124,12 @@ class _JarvisDashboardState extends State<JarvisDashboard>
                 }
                 _updateStateAnimation(_jarvisState);
               });
+            } else if (data['type'] == 'confirm_request') {
+              setState(() {
+                _pendingConfirm = {'token': data['token'], 'summary': data['summary'] ?? ''};
+              });
+            } else if (data['type'] == 'confirm_resolved') {
+              setState(() { _pendingConfirm = null; });
             } else if (data['type'] == 'telemetry') {
               setState(() {
                 if (data['cpu'] != null) _cpuLoad = (data['cpu'] as num).toDouble() / 100.0;
@@ -591,6 +598,10 @@ class _JarvisDashboardState extends State<JarvisDashboard>
             const SizedBox(height: 4),
             _buildSimStateButton('SPEAKING...', 'speaking', const Color(0xFFD946EF)),
             const SizedBox(height: 10),
+            if (_pendingConfirm != null) ...[
+              _buildConfirmCard(),
+              const SizedBox(height: 10),
+            ],
             _buildSmallNeonButton(
               'INITIALIZE DUPLEX',
               const Color(0xFF00E5FF),
@@ -607,6 +618,39 @@ class _JarvisDashboardState extends State<JarvisDashboard>
       ),
     );
   }
+  Widget _buildConfirmCard() {
+    const amber = Color(0xFFFFB703);
+    return Container(
+      padding: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: amber.withOpacity(0.08),
+        border: Border.all(color: amber.withOpacity(0.7)),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Text('CONFIRMATION REQUIRED',
+              style: TextStyle(color: amber, fontSize: 9, fontWeight: FontWeight.bold, letterSpacing: 1)),
+          const SizedBox(height: 4),
+          Text('Jarvis wants to ${_pendingConfirm?['summary'] ?? ''}.',
+              style: const TextStyle(color: Color(0xFFE2E8F0), fontSize: 10)),
+          const SizedBox(height: 4),
+          const Text('Say "confirm" or use the buttons.',
+              style: TextStyle(color: Color(0xFF94A3B8), fontSize: 9)),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Expanded(child: _buildSmallNeonButton('CONFIRM', const Color(0xFF00FF66), () => _sendCommand('confirm'))),
+              const SizedBox(width: 6),
+              Expanded(child: _buildSmallNeonButton('CANCEL', const Color(0xFFFF2A6D), () => _sendCommand('cancel'))),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildSimStateButton(String label, String state, Color color) {
     final isCurrent = _jarvisState == state;
     return MouseRegion(
@@ -760,6 +804,13 @@ class _JarvisDashboardState extends State<JarvisDashboard>
                 if (type == 'voice') logColor = const Color(0xFFD946EF);
                 if (type == 'err') logColor = const Color(0xFFFF2A6D);
                 if (type == 'cmd') logColor = const Color(0xFF00FF66);
+                if (type == 'transcript') {
+                  logColor = msg.startsWith('> You:')
+                      ? const Color(0xFFF1F5F9)
+                      : const Color(0xFF7DD3FC);
+                }
+                if (type == 'confirm_request') logColor = const Color(0xFFFFB703);
+                if (type == 'confirm_resolved') logColor = const Color(0xFF00FF66);
 
                 return Padding(
                   padding: const EdgeInsets.only(bottom: 2),

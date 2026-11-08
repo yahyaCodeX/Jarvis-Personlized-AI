@@ -3,6 +3,7 @@
 
 import datetime
 import json
+import logging
 import requests
 import os
 import re
@@ -27,6 +28,8 @@ from playwright.sync_api import sync_playwright
 import time
 import io
 from PIL import ImageGrab, Image
+
+log = logging.getLogger("jarvis.tools")
 
 # Global state for multi-turn assignment generation
 assignment_state = {
@@ -165,7 +168,7 @@ _CLEAR_WORDS   = ["clear memory", "forget everything", "reset memory", "wipe mem
 def handle_command(text):
     """
     Returns a response string if this is a local command, else returns None.
-    Special return '__CLEAR_MEMORY__' signals brain.py to wipe memory.
+    Local keyword router (used by tests and quick commands; the live server uses Gemini tools).
     """
     t = text.lower().strip()
 
@@ -318,7 +321,7 @@ def focus_browser_and_page():
         sw, sh = pyautogui.size()
         pyautogui.moveTo(sw // 2, sh // 2)
     except Exception as e:
-        print(f"[FOCUS BROWSER WARNING] {e}")
+        log.warning(f"[FOCUS BROWSER WARNING] {e}")
 
 
 def force_open_browser(url: str) -> bool:
@@ -326,7 +329,7 @@ def force_open_browser(url: str) -> bool:
     opened = False
     # Only real web URLs — never hand arbitrary text to the shell
     if not re.match(r"^https?://", url or "", re.IGNORECASE):
-        print(f"[BROWSER] Refusing non-http URL: {url!r}")
+        log.warning(f"[BROWSER] Refusing non-http URL: {url!r}")
         return False
     try:
         os.startfile(url)  # opens in the default browser, no shell involved
@@ -408,11 +411,23 @@ def search_specific_site(query, site_name):
 
 
 # --- ACADEMIC & ASSIGNMENT GENERATION ---
+def speak(text: str) -> None:
+    """Blocking Windows SAPI announcement for background jobs (call from a worker thread)."""
+    log.info(f"[SPEAK] {text}")
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        try:
+            win32com.client.Dispatch("SAPI.SpVoice").Speak(text)
+        finally:
+            pythoncom.CoUninitialize()
+    except Exception as e:
+        log.warning(f"[SPEAK] TTS failed: {e}")
+
+
 def generate_assignment_thread(topic, subject):
     from docx import Document
-    import json
-    from brain import speak
-    
+
     desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
     ollama_url = "http://localhost:11434/api/generate"
     prompt = f"Write a detailed, academic university assignment on the topic: {topic} for the subject: {subject}."
@@ -521,7 +536,7 @@ def fetch_ug_attendance():
 
     # 15-minute (900 seconds) in-memory cache check for millisecond response time
     if _attendance_cache_result and (now - _attendance_cache_timestamp < 900):
-        print("[ATTENDANCE CACHE HIT] Returning cached MIS attendance in milliseconds.")
+        log.debug("[ATTENDANCE CACHE HIT] Returning cached MIS attendance in milliseconds.")
         return _attendance_cache_result
 
     if now - _last_attendance_time < 15.0:
@@ -618,7 +633,7 @@ def fetch_ug_attendance():
         _attendance_cache_timestamp = now
         return result_msg
     except Exception as e:
-        print(f"--- SELENIUM ERROR ---\n{str(e)}\n-----------------------")
+        log.error(f"--- SELENIUM ERROR ---\n{str(e)}\n-----------------------")
         return "I encountered an error navigating the MIS portal."
 
 
@@ -774,7 +789,7 @@ def stealth_sync(page):
             from playwright_stealth.stealth import Stealth
             Stealth().apply_stealth_sync(page)
         except Exception as err:
-            print(f"[STEALTH WARNING] Could not apply stealth evasions: {err}")
+            log.warning(f"[STEALTH WARNING] Could not apply stealth evasions: {err}")
 
 
 def get_active_page():
@@ -812,7 +827,7 @@ def get_active_page():
             try:
                 stealth_sync(_active_page)
             except Exception as stealth_err:
-                print(f"[STEALTH WARNING] {stealth_err}")
+                log.warning(f"[STEALTH WARNING] {stealth_err}")
 
         # ALWAYS track the most recently opened tab or popup (handles target="_blank" links)
         try:
@@ -825,7 +840,7 @@ def get_active_page():
                     except Exception:
                         pass
         except Exception as tab_err:
-            print(f"[TAB TRACKER] Could not update active tab: {tab_err}")
+            log.debug(f"[TAB TRACKER] Could not update active tab: {tab_err}")
 
         # Final guard: if _active_page is somehow still None or closed, open a fresh page
         if _active_page is None or _active_page.is_closed():
@@ -834,7 +849,7 @@ def get_active_page():
             )
 
     except Exception as e:
-        print(f"[PLAYWRIGHT ENGINE] Re-initializing browser session on thread {current_thread} due to: {e}")
+        log.info(f"[PLAYWRIGHT ENGINE] Re-initializing browser session on thread {current_thread} due to: {e}")
         from playwright.sync_api import sync_playwright
         _playwright_context = sync_playwright().start()
         _browser = _playwright_context.chromium.launch(
@@ -873,7 +888,7 @@ def resolve_brand_url(target_name: str) -> str:
                 if real_url:
                     return real_url
     except Exception as err:
-        print(f"[URL RESOLVER WARNING] {err}")
+        log.warning(f"[URL RESOLVER WARNING] {err}")
     return None
 
 
@@ -890,7 +905,7 @@ def safe_goto(url, timeout=15000):
     except Exception as err:
         err_str = str(err).lower()
         if any(k in err_str for k in ["closed", "target", "greenlet", "context", "destroyed"]):
-            print(f"[PLAYWRIGHT AUTO-HEAL] Re-creating browser page due to closed target: {err}")
+            log.info(f"[PLAYWRIGHT AUTO-HEAL] Re-creating browser page due to closed target: {err}")
             _active_page = None
             page = get_active_page()
             page.goto(url, timeout=timeout)
@@ -928,7 +943,7 @@ def assistive_web_action(action: str, target: str = None) -> str:
                 target_nav = f"https://duckduckgo.com/?q={encoded_query}"
 
             try:
-                print(f"[ASSISTIVE WEB] Navigating to target: {target_nav}...")
+                log.info(f"[ASSISTIVE WEB] Navigating to target: {target_nav}...")
                 page.goto(target_nav, timeout=15000)
                 try:
                     page.wait_for_timeout(2000)
@@ -944,7 +959,7 @@ def assistive_web_action(action: str, target: str = None) -> str:
                 return "Please specify what to search for, sir."
             encoded_query = urllib.parse.quote(target_clean)
             search_url = f"https://duckduckgo.com/?q={encoded_query}"
-            print(f"[ASSISTIVE WEB] Searching DuckDuckGo for '{target_clean}'...")
+            log.info(f"[ASSISTIVE WEB] Searching DuckDuckGo for '{target_clean}'...")
             try:
                 page.goto(search_url, timeout=15000)
                 page_title = page.title() or target_clean
@@ -968,7 +983,7 @@ def assistive_web_action(action: str, target: str = None) -> str:
                 elif target_clean.isdigit():
                     index = int(target_clean) - 1
 
-                print(f"[ASSISTIVE WEB] Clicking search result index #{index + 1}...")
+                log.info(f"[ASSISTIVE WEB] Clicking search result index #{index + 1}...")
                 # Locate the search result link and click it
                 page.locator('h3, a[data-testid="result-title-a"], article h2 a, .result__title a').nth(index).click(timeout=5000)
                 # Wait for the new page to load
@@ -982,19 +997,19 @@ def assistive_web_action(action: str, target: str = None) -> str:
                 return f"Failed to click search result {target_clean}. Error: {e}"
 
         elif act == "scroll_down":
-            print("[ASSISTIVE WEB] Injecting JS scrollBy(0, 800)...")
+            log.info("[ASSISTIVE WEB] Injecting JS scrollBy(0, 800)...")
             page.evaluate("window.scrollBy(0, 800)")
             return "Scrolled down the page, sir."
 
         elif act == "scroll_up":
-            print("[ASSISTIVE WEB] Injecting JS scrollBy(0, -800)...")
+            log.info("[ASSISTIVE WEB] Injecting JS scrollBy(0, -800)...")
             page.evaluate("window.scrollBy(0, -800)")
             return "Scrolled up the page, sir."
 
         elif act in ["click_text", "click"]:
             if not target_clean:
                 return "Please specify text to click on the page, sir."
-            print(f"[ASSISTIVE WEB] Clicking element with text: '{target_clean}'...")
+            log.info(f"[ASSISTIVE WEB] Clicking element with text: '{target_clean}'...")
             try:
                 # Tier 1: Native Playwright text locator — works on any element type (spans, divs, anchors)
                 # This is the most reliable for e-commerce product grids where text is inside nested divs
@@ -1040,14 +1055,14 @@ def assistive_web_action(action: str, target: str = None) -> str:
                 return f"Could not find '{target_clean}' on screen. Try scrolling down and asking again, sir."
 
             except Exception as click_err:
-                print(f"[ASSISTIVE WEB] Text click error: {click_err}")
+                log.info(f"[ASSISTIVE WEB] Text click error: {click_err}")
                 return f"Failed to click '{target_clean}'. It might not be visible on screen. Error: {click_err}"
 
         elif act == "play_youtube":
             if not target_clean:
                 return "Please specify what to play on YouTube, sir."
             encoded = urllib.parse.quote(target_clean)
-            print(f"[ASSISTIVE WEB] Searching YouTube for '{target_clean}'...")
+            log.info(f"[ASSISTIVE WEB] Searching YouTube for '{target_clean}'...")
             try:
                 page.goto(f"https://www.youtube.com/results?search_query={encoded}", timeout=15000)
                 page.locator('a#video-title').first.click(timeout=5000)
@@ -1099,7 +1114,7 @@ def assistive_web_action(action: str, target: str = None) -> str:
             return f"Unknown web action '{action}', sir."
 
     except Exception as e:
-        print(f"[ASSISTIVE WEB ERROR] {e}")
+        log.error(f"[ASSISTIVE WEB ERROR] {e}")
         return f"Encountered an issue executing '{action}': {e}"
 
 
@@ -1164,7 +1179,7 @@ def assistive_checkout(address_choice: str = "home", custom_phone: str = None) -
 
     try:
         page = get_active_page()
-        print(f"[ASSISTIVE CHECKOUT] Extracting visible form fields from active page ({addr_type} profile)...")
+        log.info(f"[ASSISTIVE CHECKOUT] Extracting visible form fields from active page ({addr_type} profile)...")
 
         # 1. Dynamic Field Extraction via JS DOM evaluate
         extracted_fields = page.evaluate("""
@@ -1191,7 +1206,7 @@ def assistive_checkout(address_choice: str = "home", custom_phone: str = None) -
             }
         """)
 
-        print(f"[ASSISTIVE CHECKOUT] Extracted {len(extracted_fields)} visible form input fields.")
+        log.info(f"[ASSISTIVE CHECKOUT] Extracted {len(extracted_fields)} visible form input fields.")
 
         # 2. LLM-Powered Mapping using Gemini Client
         dynamic_mapping = {}
@@ -1222,10 +1237,10 @@ Rules:
                         resp = client.models.generate_content(model=model_name, contents=prompt)
                         if resp and resp.text:
                             raw_response = resp.text.strip()
-                            print(f"[ASSISTIVE CHECKOUT] LLM Mapping succeeded via {model_name}.")
+                            log.info(f"[ASSISTIVE CHECKOUT] LLM Mapping succeeded via {model_name}.")
                             break
                     except Exception as m_err:
-                        print(f"[ASSISTIVE CHECKOUT LLM WARNING] Model {model_name} error: {m_err}")
+                        log.warning(f"[ASSISTIVE CHECKOUT LLM WARNING] Model {model_name} error: {m_err}")
 
                 if raw_response:
                     clean_json = raw_response
@@ -1236,23 +1251,23 @@ Rules:
                     dynamic_mapping = json.loads(clean_json)
 
             except Exception as llm_err:
-                print(f"[ASSISTIVE CHECKOUT LLM ERROR] {llm_err}")
+                log.error(f"[ASSISTIVE CHECKOUT LLM ERROR] {llm_err}")
 
         # 3. Dynamic Injection based on Gemini LLM mapping
         if dynamic_mapping:
-            print(f"[ASSISTIVE CHECKOUT] Injecting LLM-mapped fields: {dynamic_mapping}")
+            log.info(f"[ASSISTIVE CHECKOUT] Injecting LLM-mapped fields: {dynamic_mapping}")
             for field_identifier, user_value in dynamic_mapping.items():
                 if not field_identifier or user_value is None:
                     continue
                 try:
                     page.locator(f"[name='{field_identifier}'], [id='{field_identifier}']").first.fill(str(user_value), timeout=2000)
-                    print(f"[ASSISTIVE CHECKOUT] Filled '{field_identifier}' -> '{user_value}'")
+                    log.info(f"[ASSISTIVE CHECKOUT] Filled '{field_identifier}' -> '{user_value}'")
                 except Exception as fill_err:
-                    print(f"[ASSISTIVE CHECKOUT WARNING] Could not fill '{field_identifier}': {fill_err}")
+                    log.warning(f"[ASSISTIVE CHECKOUT WARNING] Could not fill '{field_identifier}': {fill_err}")
 
         else:
             # Fallback heuristic form filling if LLM mapping was unavailable
-            print("[ASSISTIVE CHECKOUT] Using heuristic fallback form filling...")
+            log.info("[ASSISTIVE CHECKOUT] Using heuristic fallback form filling...")
             try:
                 page.locator('input[name="checkout[email_or_phone]"], input[name="checkout[email]"], input[type="email"], input[id="checkout_email_or_phone"]').first.fill(selected_email, timeout=2000)
             except Exception: pass
@@ -1276,17 +1291,17 @@ Rules:
         try:
             page.wait_for_timeout(1000)
             page.locator('label:has-text("Cash on Delivery"), label:has-text("COD")').first.click(timeout=3000)
-            print("[ASSISTIVE CHECKOUT] Clicked Cash on Delivery (COD) payment option.")
+            log.info("[ASSISTIVE CHECKOUT] Clicked Cash on Delivery (COD) payment option.")
         except Exception:
-            print("[Playwright] COD option not found, might require navigating to the next page first.")
+            log.info("[Playwright] COD option not found, might require navigating to the next page first.")
 
         # Freeze browser for visual inspection
-        print("[ASSISTIVE CHECKOUT] Freezing browser for visual verification...")
+        log.info("[ASSISTIVE CHECKOUT] Freezing browser for visual verification...")
         page.wait_for_timeout(15000)
         return "Checkout details injected successfully using dynamic LLM form mapping. Please verify the screen."
 
     except Exception as e:
-        print(f"[ASSISTIVE CHECKOUT ERROR] {e}")
+        log.error(f"[ASSISTIVE CHECKOUT ERROR] {e}")
         return f"Checkout details injected. Please verify the screen. Error: {e}"
 
 
@@ -1310,10 +1325,10 @@ def analyze_active_screen(query: str = None) -> str:
                 img.save(img_byte_arr, format='PNG')
                 image_bytes = img_byte_arr.getvalue()
             except Exception as capture_err:
-                print(f"[SCREEN CAPTURE WARNING] {capture_err}")
+                log.warning(f"[SCREEN CAPTURE WARNING] {capture_err}")
 
         if not image_bytes:
-            print("[SCREEN VISION] Desktop capture unavailable — searching page text...")
+            log.warning("[SCREEN VISION] Desktop capture unavailable — searching page text...")
             return assistive_web_action("search", query_str)
 
         api_key = os.getenv("GEMINI_API_KEY")
@@ -1342,10 +1357,10 @@ def analyze_active_screen(query: str = None) -> str:
                     ]
                 )
                 if response and response.text:
-                    print(f"[SCREEN VISION] Success using model {vmodel}")
+                    log.info(f"[SCREEN VISION] Success using model {vmodel}")
                     break
             except Exception as m_err:
-                print(f"[SCREEN VISION] Model {vmodel} failed ({m_err}), trying fallback...")
+                log.warning(f"[SCREEN VISION] Model {vmodel} failed ({m_err}), trying fallback...")
 
         if response and response.text:
             return response.text.strip()
@@ -1353,7 +1368,7 @@ def analyze_active_screen(query: str = None) -> str:
             return f"Screen captured, but I could not find clear pricing details for '{query_str}', sir."
 
     except Exception as e:
-        print(f"[SCREEN VISION ERROR] {e}")
+        log.error(f"[SCREEN VISION ERROR] {e}")
         return assistive_web_action("search", query_str)
 
 
@@ -1380,7 +1395,7 @@ def debug_active_screen_code(issue_hint: str = None) -> str:
                 image_bytes = img_byte_arr.getvalue()
                 mime_type = "image/jpeg"
             except Exception as cap_err:
-                print(f"[GHOST CODER] Screen capture failed: {cap_err}")
+                log.warning(f"[GHOST CODER] Screen capture failed: {cap_err}")
 
         if not image_bytes:
             return "Could not capture the screen for debugging, sir."
@@ -1419,15 +1434,15 @@ def debug_active_screen_code(issue_hint: str = None) -> str:
                     ]
                 )
                 if response and response.text:
-                    print(f"[GHOST CODER] Diagnosis complete using {vmodel}.")
+                    log.info(f"[GHOST CODER] Diagnosis complete using {vmodel}.")
                     return response.text.strip()
             except Exception as m_err:
-                print(f"[GHOST CODER] Model {vmodel} failed ({m_err}), trying fallback...")
+                log.warning(f"[GHOST CODER] Model {vmodel} failed ({m_err}), trying fallback...")
 
         return "I analyzed the screen but could not produce a diagnosis. Please try again, sir."
 
     except Exception as e:
-        print(f"[GHOST CODER ERROR] {e}")
+        log.error(f"[GHOST CODER ERROR] {e}")
         return f"Failed to analyze the code on screen. Error: {e}"
 
 
@@ -1442,17 +1457,17 @@ def read_local_file(filepath: str) -> str:
     """
     ok, resolved = check_path(filepath)
     if not ok:
-        print(f"[FILE I/O BLOCKED] read {filepath}: {resolved}")
+        log.warning(f"[FILE I/O BLOCKED] read {filepath}: {resolved}")
         return resolved
     filepath = resolved
     if os.path.isfile(filepath) and os.path.getsize(filepath) > MAX_READ_BYTES:
         return f"File is too large to read aloud ({os.path.getsize(filepath) // 1024} KB, limit {MAX_READ_BYTES // 1024} KB)."
-    print(f"[FILE I/O] Reading: {filepath}")
+    log.info(f"[FILE I/O] Reading: {filepath}")
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
         lines = content.count('\n') + 1
-        print(f"[FILE I/O] Read {lines} lines from {filepath}.")
+        log.info(f"[FILE I/O] Read {lines} lines from {filepath}.")
         return f"--- FILE: {filepath} ({lines} lines) ---\n{content}"
     except UnicodeDecodeError:
         # Fallback for files with mixed encodings (e.g. legacy Windows source)
@@ -1476,10 +1491,10 @@ def write_local_file(filepath: str, new_content: str) -> str:
     """
     ok, resolved = check_path(filepath)
     if not ok:
-        print(f"[FILE I/O BLOCKED] write {filepath}: {resolved}")
+        log.warning(f"[FILE I/O BLOCKED] write {filepath}: {resolved}")
         return resolved
     filepath = resolved
-    print(f"[FILE I/O] Writing: {filepath}")
+    log.info(f"[FILE I/O] Writing: {filepath}")
     try:
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         # Keep the previous version so any AI edit can be undone
@@ -1491,7 +1506,7 @@ def write_local_file(filepath: str, new_content: str) -> str:
             f.write(new_content)
         os.replace(tmp_path, filepath)
         lines = new_content.count('\n') + 1
-        print(f"[FILE I/O] Successfully wrote {lines} lines to {filepath}.")
+        log.info(f"[FILE I/O] Successfully wrote {lines} lines to {filepath}.")
         backup_note = f" Previous version saved as {os.path.basename(filepath)}.bak." if os.path.isfile(filepath + ".bak") else ""
         return f"Successfully updated and saved {lines} lines of code to {filepath}.{backup_note}"
     except Exception as e:
@@ -1653,7 +1668,7 @@ def process_fast_command(text):
     elif any(p in text_clean for p in ["check my attendance", "show my attendance", "open mis portal", "attendance", "attendence"]):
         return fetch_ug_attendance()
 
-    # Returning None tells brain.py to forward the prompt to Qwen/Ollama
+    # Returning None means "not a local command"
     return None
 
 
@@ -1976,7 +1991,7 @@ def write_to_notepad_async(content: str, title: str = "notes.txt") -> str:
 
 def shutdown_assistant() -> str:
     """Terminates the Jarvis assistant application cleanly."""
-    print("\n👋 Shutting down Jarvis... Goodbye, sir.")
+    log.info("\n👋 Shutting down Jarvis... Goodbye, sir.")
     try:
         import win32com.client
         speaker = win32com.client.Dispatch("SAPI.SpVoice")
@@ -2098,7 +2113,7 @@ def search_youtube(query: str) -> str:
                     break
                     
         preview_str = "\n".join(titles_preview)
-        print(f"[YOUTUBE SEARCH] Top Results:\n{preview_str}")
+        log.info(f"[YOUTUBE SEARCH] Top Results:\n{preview_str}")
         return "Search complete. Ready to play."
     except Exception as e:
         # Fallback to web browser search if Selenium fails
@@ -2431,30 +2446,37 @@ def search_maps(query: str) -> str:
 
 
 # ─── MEMORY & IDENTITY ────────────────────────────────────────
-MEMORY_FILE = "jarvis_memory.json"
+# Absolute path: the file used to land in whatever folder Jarvis was started from.
+MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_memory.json")
+MAX_MEMORIES = 200
+
+
+def _load_memories() -> list:
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
 
 
 def remember_fact(fact: str) -> str:
-    """Appends a new fact to the permanent JSON memory file."""
-    fact_clean = fact.strip()
+    """Appends a new fact to the permanent JSON memory file (atomic write, de-duplicated)."""
+    fact_clean = (fact or "").strip()
     if not fact_clean:
         return "Fact cannot be empty, sir."
-        
-    memories = []
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-                memories = json.load(f)
-                if not isinstance(memories, list):
-                    memories = []
-        except Exception:
-            memories = []
-            
+
+    memories = _load_memories()
+    if any(m.lower() == fact_clean.lower() for m in memories):
+        return f"I already know that, sir: '{fact_clean}'."
     memories.append(fact_clean)
-    
+    memories = memories[-MAX_MEMORIES:]
+
+    tmp_path = MEMORY_FILE + ".tmp"
     try:
-        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(memories, f, indent=2)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(memories, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, MEMORY_FILE)  # atomic: never leaves a half-written file
         return f"Remembered: '{fact_clean}', sir."
     except Exception as e:
         return f"Failed to save memory: {e}"
@@ -2462,18 +2484,7 @@ def remember_fact(fact: str) -> str:
 
 def get_all_memories() -> str:
     """Reads saved facts from the permanent JSON memory file and returns them formatted."""
-    if not os.path.exists(MEMORY_FILE):
+    memories = _load_memories()
+    if not memories:
         return "No previous memories."
-        
-    try:
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-            memories = json.load(f)
-            if isinstance(memories, list) and memories:
-                formatted = "\n".join([f"- {m}" for m in memories])
-                return formatted
-            return "No previous memories."
-    except Exception:
-        return "No previous memories."
-
-
-
+    return "\n".join(f"- {m}" for m in memories)

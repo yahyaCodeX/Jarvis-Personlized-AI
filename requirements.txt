@@ -1,27 +1,40 @@
-# Jarvis Personal AI — Python Dependencies
-# Install with: pip install -r requirements.txt
+# Jarvis Personal AI — Python dependencies (Windows, Python 3.10+; tested on 3.13)
+# Install:  pip install -r requirements.txt
+# Then:     playwright install chromium
 
-speechrecognition>=3.10.0
-pywin32>=306           # Windows SAPI TTS (reliable, never hangs)
-requests>=2.28.0
-colorama>=0.4.6
+# ── Core: Gemini Live server + Flutter HUD bridge ─────────────────
+google-genai>=2.18          # Gemini Live API (session resumption, transcription)
+websockets>=14.0            # ws://localhost:8765 bridge to the Flutter HUD
+python-dotenv>=1.0
+requests>=2.28
+
+# ── Audio & voice biometrics ──────────────────────────────────────
 pyaudio>=0.2.13
+SpeechRecognition>=3.10     # voice-auth recording + enroll_voice.py
+standard-aifc; python_version >= "3.13"   # removed from stdlib in 3.13, needed by SpeechRecognition
+audioop-lts; python_version >= "3.13"
+speechbrain==0.5.16         # speaker verification (pinned: newer versions changed the API)
+torch>=2.0
+torchaudio>=2.0
+soundfile>=0.12             # audio loading without FFmpeg (see auth/voice_auth.py)
 
-# Action system dependencies
-pycaw>=20181226        # Windows Core Audio -- volume control
-psutil>=5.9.0          # Process listing/killing -- close_app
-pillow>=10.0.0         # PIL.ImageGrab -- take_screenshot
-pyautogui>=0.9.54      # Fallback screenshot if Pillow unavailable
-pyperclip>=1.8.2       # Clipboard utility -- read clipboard
-python-docx>=0.8.11    # Word Document generation for academic assignments
-selenium>=4.10.0       # Browser automation for MUET attendance login
-webdriver-manager>=4.0.0 # WebDriver Manager for Selenium Chrome support
-speechbrain==0.5.16     # Voice biometric speaker recognition library
-torch>=2.0.0            # Deep learning backend for SpeechBrain
-torchaudio>=2.0.0       # Audio loading backend for SpeechBrain
+# ── Windows automation ────────────────────────────────────────────
+pywin32>=306                # SAPI TTS, Explorer/COM control
+psutil>=5.9                 # telemetry, process management
+pillow>=10.0                # screenshots for screen vision / Ghost Coder
+pyautogui>=0.9.54
+pyperclip>=1.8.2
 
-# Gemini Live API dependencies
-google-genai
-python-dotenv
+# ── Browser automation ────────────────────────────────────────────
+playwright>=1.40            # assistive web navigation & checkout
+playwright-stealth>=2.0
+beautifulsoup4>=4.12        # DuckDuckGo result parsing
+pywhatkit>=5.4              # direct YouTube playback
+selenium>=4.10              # MUET MIS attendance login
+webdriver-manager>=4.0
 
+# ── Documents ─────────────────────────────────────────────────────
+python-docx>=0.8.11         # assignment generator
 
+# ── Development ───────────────────────────────────────────────────
+pytest>=8.0

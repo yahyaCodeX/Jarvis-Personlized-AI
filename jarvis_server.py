@@ -17,11 +17,9 @@ import os
 import psutil
 import pyaudio
 import pythoncom
-import queue as thread_queue
 import struct
 import threading
 import time
-import traceback
 import websockets
 import win32com.client
 from dotenv import load_dotenv
@@ -60,9 +58,11 @@ from commands import (
     page_scroll,
     site_interaction,
 )
-from config import load_profile, get_secret, LIVE_MODELS
+from config import load_profile, get_secret, LIVE_MODELS, setup_logging
 from safety import gate, confirmation_required, check_path
 import re
+
+log = logging.getLogger("jarvis.server")
 
 load_dotenv()
 
@@ -81,14 +81,7 @@ INPUT_SAMPLE_RATE  = 16000
 OUTPUT_SAMPLE_RATE = 24000
 CHUNK_SIZE         = 1024          # samples per read
 MIC_CHANNELS       = 4            # Realtek 4-ch WASAPI array
-MIC_DEVICE_INDEX   = 1            # Microphone Array (3- Realtek(R))
-
-print()
-print("=" * 60)
-print("  J.A.R.V.I.S — THREADED AUDIO ARCHITECTURE")
-print(f"  Mic: device {MIC_DEVICE_INDEX}  (4-ch 16kHz WASAPI)")
-print("=" * 60)
-print()
+MIC_DEVICE_INDEX   = 1            # Microphone Array (3- Realtek(R)) — fallback if default mic fails
 
 # ============================================================
 #  Global state
@@ -136,6 +129,7 @@ TOOL_DEDUPE_SECONDS    = 3.0
 
 _live_task: asyncio.Task | None = None   # the running run_gemini_live() task
 _last_latency_ms: float | None = None    # end of user speech -> first reply audio
+_live_session = None                      # current Gemini Live session (for HUD-confirmed actions)
 
 
 # ============================================================
@@ -156,7 +150,7 @@ def speak_tts(text: str) -> None:
         pythoncom.CoInitialize()
         win32com.client.Dispatch("SAPI.SpVoice").Speak(text)
     except Exception as exc:
-        print(f"[TTS ERROR] {exc}")
+        log.error(f"[TTS ERROR] {exc}")
     finally:
         pythoncom.CoUninitialize()
 
@@ -231,7 +225,7 @@ async def _run_tool(name: str, args: dict) -> str:
     try:
         return str(await asyncio.to_thread(_run_tool_in_clean_thread, fn, **args))
     except Exception as exc:
-        print(f"[TOOL ERROR] {name}: {exc}")
+        log.error(f"[TOOL ERROR] {name}: {exc}")
         return f"Error in {name}: {exc}"
 
 
@@ -243,19 +237,24 @@ async def execute_tool_safely(name: str, args: dict) -> str:
     if name not in _NO_DEBOUNCE:
         key = (name, json.dumps(args, sort_keys=True, default=str))
         if now - _last_tool_timestamps.get(key, 0) < TOOL_DEDUPE_SECONDS:
-            print(f"[TOOL DEDUPE] Skipped duplicate '{name}' {args}")
+            log.debug(f"[TOOL DEDUPE] Skipped duplicate '{name}' {args}")
             return f"'{name}' was just run with the same arguments, sir."
         _last_tool_timestamps[key] = now
 
     async with _tool_lock:
         # ── Step 2 of a sensitive action: the user has (maybe) answered ──────
         if name == "confirm_action":
-            ok, info = gate.resolve(str(args.get("token", "")))
+            token = str(args.get("token", ""))
+            ok, info = gate.resolve(token)
             if not ok:
-                print(f"[CONFIRM] Not approved: {info}")
+                log.info(f"[CONFIRM] Not approved: {info}")
+                if not gate.is_pending(token):   # declined/expired → HUD can hide the prompt
+                    await broadcast("confirm_resolved", {"token": token, "approved": False,
+                                                         "message": "Action cancelled."})
                 return str(info)
-            print(f"[CONFIRM] User approved '{info['name']}' — executing.")
-            await broadcast("status", {"state": "processing", "message": f"Confirmed: {info['summary']}"})
+            log.info(f"[CONFIRM] User approved '{info['name']}' — executing.")
+            await broadcast("confirm_resolved", {"token": token, "approved": True,
+                                                 "message": f"Confirmed: {info['summary']}"})
             return await _run_tool(info["name"], info["args"])
 
         # ── Step 1 of a sensitive action: ask before doing anything ─────────
@@ -263,8 +262,9 @@ async def execute_tool_safely(name: str, args: dict) -> str:
             summary = SENSITIVE_TOOLS[name](args)
             if summary is not None:
                 token = gate.request(name, args, summary)
-                print(f"[CONFIRM] Pending '{name}' token={token}: {summary}")
-                await broadcast("confirm_request", {"token": token, "tool": name, "summary": summary})
+                log.info(f"[CONFIRM] Pending '{name}' token={token}: {summary}")
+                await broadcast("confirm_request", {"token": token, "tool": name, "summary": summary,
+                                                    "message": f"Awaiting your confirmation: {summary}"})
                 return (
                     f"CONFIRMATION REQUIRED — nothing has been done yet. "
                     f"Tell the user out loud that you are about to {summary}, and ask them to say 'confirm' or 'cancel'. "
@@ -352,9 +352,9 @@ def _mic_capture_thread(
             input=True,
             frames_per_buffer=CHUNK_SIZE,
         )
-        print("[MIC THREAD] 1-channel 16kHz default mic stream open.")
+        log.info("[MIC THREAD] 1-channel 16kHz default mic stream open.")
     except Exception as exc:
-        print(f"[MIC THREAD] Default mic open failed ({exc}), retrying on device 1...")
+        log.warning(f"[MIC THREAD] Default mic open failed ({exc}), retrying on device 1...")
         stream = pa.open(
             format=pyaudio.paInt16,
             channels=1,
@@ -379,7 +379,7 @@ def _mic_capture_thread(
                 n       = len(pcm) // 2
                 raw_rms = (math.sqrt(sum(s * s for s in struct.unpack(f"<{n}h", pcm)) / n)
                            / 32768.0) if n else 0.0
-                print(
+                log.debug(
                     f"[MIC THREAD] raw_rms={raw_rms:.4f}"
                     f"  frames={frame_n}"
                     f"  jarvis_speaking={is_jarvis_speaking}"
@@ -401,26 +401,34 @@ def _mic_capture_thread(
             loop.call_soon_threadsafe(mic_queue.put_nowait, pcm)
 
     except Exception as exc:
-        print(f"[MIC THREAD CRASH] {exc}")
-        traceback.print_exc()
+        log.exception(f"[MIC THREAD CRASH] {exc}")  # includes the traceback
     finally:
         stream.stop_stream()
         stream.close()
         pa.terminate()
-        print("[MIC THREAD] Stopped.")
+        log.info("[MIC THREAD] Stopped.")
 
 
 # ============================================================
 #  Gemini Live Engine
 # ============================================================
 
+def _load_personality() -> str:
+    """Persona & speaking style from personality.txt (edit that file, not code)."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "personality.txt")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return "You are Jarvis, a concise, witty personal AI assistant. Keep spoken replies short."
+
+
 def build_live_config() -> types.LiveConnectConfig:
     """Build the system prompt (with saved memories) and the full Gemini Live config."""
     memories      = get_all_memories()
     system_prompt = (
-        "You are J.A.R.V.I.S, an advanced AI operating system.\n"
-        "You were created by Muhammad Yahya Siddiqui, a Computer Systems Engineering "
-        "student at MUET and a backend software developer. He is your creator and primary user.\n"
+        f"{_load_personality()}\n\n"
+        "You are J.A.R.V.I.S, an advanced AI operating system running on the user's Windows PC.\n"
         "When asked to remember something, use the `remember_fact` tool.\n"
         f"Memories from previous sessions:\n{memories}\n\n"
         "ASSISTIVE WEB NAVIGATION & CHECKOUT PROTOCOL (SDG 10):\n"
@@ -458,6 +466,8 @@ def build_live_config() -> types.LiveConnectConfig:
         # Transcribe the USER's mic audio — used by the confirmation gate
         # (and available for a live transcript in the HUD).
         input_audio_transcription=types.AudioTranscriptionConfig(),
+        # Transcribe Jarvis's own speech too — shown as text in the HUD.
+        output_audio_transcription=types.AudioTranscriptionConfig(),
         # Long conversations: drop the oldest turns instead of hitting the
         # context limit and getting disconnected.
         context_window_compression=types.ContextWindowCompressionConfig(
@@ -719,12 +729,12 @@ def build_live_config() -> types.LiveConnectConfig:
 
 
 async def run_gemini_live() -> None:
-    global session_running, audio_out_queue, is_jarvis_speaking
+    global session_running, audio_out_queue, is_jarvis_speaking, _live_session
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         msg = "GEMINI_API_KEY not found in .env!"
-        print(f"[CRITICAL] {msg}")
+        log.error(f"[CRITICAL] {msg}")
         await broadcast("status", {"state": "alert", "message": msg})
         session_running = False
         return
@@ -737,11 +747,11 @@ async def run_gemini_live() -> None:
     # ── Kill any zombie mic thread from a previous crashed session ───────────
     global _active_mic_stop_event, _active_mic_thread
     if _active_mic_stop_event is not None and not _active_mic_stop_event.is_set():
-        print("[MIC THREAD] WARNING: Previous mic thread still alive — killing it now.")
+        log.warning("[MIC THREAD] WARNING: Previous mic thread still alive — killing it now.")
         _active_mic_stop_event.set()
     if _active_mic_thread is not None and _active_mic_thread.is_alive():
         _active_mic_thread.join(timeout=3.0)
-        print("[MIC THREAD] Previous zombie thread joined.")
+        log.info("[MIC THREAD] Previous zombie thread joined.")
 
     # ── Shared objects for the mic thread ────────────────────────────────────
     mic_queue  = asyncio.Queue()          # PCM chunks produced by the thread
@@ -760,7 +770,7 @@ async def run_gemini_live() -> None:
     )
     mic_thread.start()
     _active_mic_thread = mic_thread
-    print("[MIC THREAD] Background capture thread started.")
+    log.info("[MIC THREAD] Background capture thread started.")
 
     await broadcast("status", {
         "state":   "listening",
@@ -795,12 +805,12 @@ async def run_gemini_live() -> None:
                         )
                         sends += 1
                     except Exception as exc:
-                        print(f"[MIC WORKER] Connection dropped by server: {exc}")
+                        log.warning(f"[MIC WORKER] Connection dropped by server: {exc}")
                         return  # Exit worker cleanly so outer reconnect loop takes over
 
                     now = time.time()
                     if now - last_send_log >= 10.0:
-                        print(f"[MIC WORKER] {sends} payloads sent in last 10s  "
+                        log.debug(f"[MIC WORKER] {sends} payloads sent in last 10s  "
                               f"queue_size={mic_queue.qsize()}  "
                               f"buf_remaining={len(audio_buffer)}B")
                         sends         = 0
@@ -809,7 +819,7 @@ async def run_gemini_live() -> None:
                 await asyncio.sleep(0.001)
 
         except Exception as exc:
-            print(f"[MIC WORKER EXITED] {exc}")
+            log.info(f"[MIC WORKER EXITED] {exc}")
 
     # ── speaker_worker ───────────────────────────────────────────────────────
     async def speaker_worker() -> None:
@@ -849,7 +859,7 @@ async def run_gemini_live() -> None:
                             "message": "Listening for your next command...",
                         })
         except Exception as exc:
-            print(f"[SPEAKER ERROR] {exc}")
+            log.error(f"[SPEAKER ERROR] {exc}")
         finally:
             is_jarvis_speaking = False
             spk.stop_stream()
@@ -867,7 +877,17 @@ async def run_gemini_live() -> None:
         recv_n        = 0
         last_recv_log = time.time()
         last_user_speech_ts: float | None = None   # for latency measurement
-        print("[RECEIVER] Worker started — waiting for Gemini responses...")
+        user_buf:   list[str] = []   # transcription arrives in fragments —
+        jarvis_buf: list[str] = []   # buffer them into whole sentences for the HUD
+
+        async def flush_transcript(role: str, buf: list[str]) -> None:
+            text = "".join(buf).strip()
+            buf.clear()
+            if text:
+                label = "You" if role == "user" else "Jarvis"
+                log.info(f"[TRANSCRIPT] {label}: {text}")
+                await broadcast("transcript", {"role": role, "text": text, "message": f"{label}: {text}"})
+        log.info("[RECEIVER] Worker started — waiting for Gemini responses...")
 
         while session_running:
             try:
@@ -883,13 +903,13 @@ async def run_gemini_live() -> None:
 
                     # Server is about to close this connection (session time limit)
                     if resp.go_away:
-                        print(f"[GEMINI] GoAway received (time left: {resp.go_away.time_left}) — reconnecting with resume handle.")
+                        log.info(f"[GEMINI] GoAway received (time left: {resp.go_away.time_left}) — reconnecting with resume handle.")
                         return
 
                     # Heartbeat: warn if nothing received for >15 seconds
                     now = time.time()
                     if now - last_recv_log >= 15.0:
-                        print(f"[RECEIVER] Heartbeat: {recv_n} total responses received so far.")
+                        log.debug(f"[RECEIVER] Heartbeat: {recv_n} total responses received so far.")
                         last_recv_log = now
 
                     # Debug summary line
@@ -904,18 +924,27 @@ async def run_gemini_live() -> None:
                                 if p.text:        tags.append(f"text='{p.text[:50]}'")
                     if resp.tool_call:
                         tags.append(f"tool_call({len(resp.tool_call.function_calls)})")
-                    print(f"[RECV #{recv_n}] {', '.join(tags) or 'empty'}")
+                    log.debug(f"[RECV #{recv_n}] {', '.join(tags) or 'empty'}")
                     last_recv_log = time.time()
 
-                    # User's own speech transcript → confirmation gate + HUD
+                    # User's own speech transcript → confirmation gate (+ HUD, as whole sentences)
                     if sc and sc.input_transcription and sc.input_transcription.text:
                         heard = sc.input_transcription.text
                         last_user_speech_ts = time.time()
                         gate.record_user_speech(heard)
-                        await broadcast("transcript", {"role": "user", "text": heard})
+                        user_buf.append(heard)
+
+                    # What Jarvis is saying (for the HUD transcript / accessibility)
+                    if sc and sc.output_transcription and sc.output_transcription.text:
+                        jarvis_buf.append(sc.output_transcription.text)
+
+                    # Jarvis started answering → the user's sentence is complete
+                    if (sc and (sc.model_turn or sc.turn_complete)) or resp.tool_call:
+                        await flush_transcript("user", user_buf)
 
                     # Interruption → drain queue immediately
                     if sc and sc.interrupted:
+                        await flush_transcript("jarvis", jarvis_buf)
                         is_jarvis_speaking = False
                         while not audio_out_queue.empty():
                             try:
@@ -938,6 +967,7 @@ async def run_gemini_live() -> None:
 
                     # Turn complete → back to listening HUD state
                     if sc and sc.turn_complete:
+                        await flush_transcript("jarvis", jarvis_buf)
                         await broadcast("status", {"state": "listening", "message": "Listening..."})
 
                     # Tool calls
@@ -946,13 +976,13 @@ async def run_gemini_live() -> None:
                             fn_name = call.name
                             fn_id   = call.id
                             fn_args = call.args if hasattr(call, "args") and call.args else {}
-                            print(f"[TOOL] '{fn_name}' args={fn_args}")
+                            log.info(f"[TOOL] '{fn_name}' args={fn_args}")
                             await broadcast("status", {
                                 "state":   "processing",
                                 "message": f"Executing: {fn_name}",
                             })
                             result = await execute_tool_safely(fn_name, fn_args)
-                            print(f"[TOOL RESULT] '{fn_name}' → {result}")
+                            log.info(f"[TOOL RESULT] '{fn_name}' → {result}")
                             await session.send_tool_response(
                                 function_responses=[
                                     types.FunctionResponse(
@@ -963,11 +993,11 @@ async def run_gemini_live() -> None:
 
                 if not got_any:
                     # receive() ended without yielding anything: socket is gone
-                    print("[RECEIVER CLOSED] Stream ended.")
+                    log.info("[RECEIVER CLOSED] Stream ended.")
                     return
 
             except Exception as exc:
-                print(f"[RECEIVER CLOSED] Connection closed: {exc}")
+                log.info(f"[RECEIVER CLOSED] Connection closed: {exc}")
                 return
 
     # ── Auto-Reconnect Connection Loop ───────────────────────────────────────
@@ -989,7 +1019,7 @@ async def run_gemini_live() -> None:
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for t in done:
                 exc = t.exception() if not t.cancelled() else None
-                print(f"[WORKER EXIT] {t.get_name()}" + (f": {exc}" if exc else ""))
+                log.info(f"[WORKER EXIT] {t.get_name()}" + (f": {exc}" if exc else ""))
         finally:
             for t in tasks:
                 t.cancel()
@@ -999,7 +1029,7 @@ async def run_gemini_live() -> None:
         while session_running:
             current_model = models_to_try[model_idx % len(models_to_try)]
             handle = resume["handle"]
-            print(f"[GEMINI] Connecting to {current_model}" + (" (resuming previous session)" if handle else "") + "...")
+            log.info(f"[GEMINI] Connecting to {current_model}" + (" (resuming previous session)" if handle else "") + "...")
             session_config = config.model_copy(update={
                 "session_resumption": types.SessionResumptionConfig(handle=handle),
             })
@@ -1008,7 +1038,8 @@ async def run_gemini_live() -> None:
             try:
                 async with client.aio.live.connect(model=current_model, config=session_config) as session:
                     connected_at = time.time()
-                    print(f"[GEMINI] Connected to {current_model} successfully!")
+                    _live_session = session
+                    log.info(f"[GEMINI] Connected to {current_model} successfully!")
                     await broadcast("status", {"state": "listening", "message": "Listening..."})
 
                     # Drop audio captured while we were disconnected
@@ -1027,22 +1058,25 @@ async def run_gemini_live() -> None:
                                 turn_complete=True,
                             )
                         except Exception as greeting_err:
-                            print(f"[GEMINI] Initial greeting warning: {greeting_err}")
+                            log.warning(f"[GEMINI] Initial greeting warning: {greeting_err}")
 
-                    await run_workers(session)
+                    try:
+                        await run_workers(session)
+                    finally:
+                        _live_session = None
 
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 err_str = str(exc).lower()
-                print(f"[GEMINI SESSION DISCONNECTED] {exc}")
+                log.warning(f"[GEMINI SESSION DISCONNECTED] {exc}")
                 if resume["handle"] and ("handle" in err_str or "resum" in err_str or "invalid" in err_str):
-                    print("[GEMINI] Resume handle rejected — starting a fresh session.")
+                    log.warning("[GEMINI] Resume handle rejected — starting a fresh session.")
                     resume["handle"] = None
                 elif any(k in err_str for k in ("1008", "not found", "not supported", "404", "permission")):
                     model_idx += 1
                     resume["handle"] = None  # handles are model-specific
-                    print(f"[GEMINI] Model unavailable — falling back to {models_to_try[model_idx % len(models_to_try)]}")
+                    log.warning(f"[GEMINI] Model unavailable — falling back to {models_to_try[model_idx % len(models_to_try)]}")
 
             if not session_running:
                 break
@@ -1050,7 +1084,7 @@ async def run_gemini_live() -> None:
             # A session that lived a while was healthy — reset the backoff
             if connected_at and time.time() - connected_at > 30:
                 backoff_s = 2.0
-            print(f"[GEMINI] Reconnecting in {backoff_s:.0f} seconds...")
+            log.info(f"[GEMINI] Reconnecting in {backoff_s:.0f} seconds...")
             await broadcast("status", {"state": "idle", "message": "Reconnecting to Gemini Live..."})
             await asyncio.sleep(backoff_s)
             backoff_s = min(backoff_s * 2, 30.0)
@@ -1061,12 +1095,47 @@ async def run_gemini_live() -> None:
         session_running    = False
         is_jarvis_speaking = False
         await asyncio.to_thread(mic_thread.join, 3.0)   # don't block the event loop
-        print("[MIC THREAD] Joined.")
+        log.info("[MIC THREAD] Joined.")
 
 
 # ============================================================
 #  WebSocket handler (Flutter ↔ Python bridge)
 # ============================================================
+
+async def _tell_gemini(note: str) -> None:
+    """Let the live model know about something that happened outside the conversation."""
+    if _live_session is None:
+        return
+    try:
+        await _live_session.send_client_content(
+            turns=[types.Content(role="user", parts=[types.Part.from_text(text=f"[System note] {note}")])],
+            turn_complete=True,
+        )
+    except Exception as exc:
+        log.warning(f"[HUD] Could not notify Gemini: {exc}")
+
+
+async def _resolve_from_hud(approved: bool) -> None:
+    """HUD Confirm/Cancel: act on the newest pending sensitive action immediately."""
+    popped = gate.pop_latest()
+    if popped is None:
+        await broadcast("status", {"state": "listening", "message": "Nothing is waiting for confirmation."})
+        return
+    token, entry = popped
+    if not approved:
+        log.info(f"[CONFIRM] Cancelled from HUD: {entry['summary']}")
+        await broadcast("confirm_resolved", {"token": token, "approved": False, "message": "Action cancelled."})
+        await _tell_gemini(f"The user pressed Cancel on screen for: {entry['summary']}. Nothing was done. Acknowledge briefly.")
+        return
+
+    log.info(f"[CONFIRM] Approved from HUD: {entry['summary']}")
+    await broadcast("confirm_resolved", {"token": token, "approved": True, "message": f"Confirmed: {entry['summary']}"})
+    async with _tool_lock:
+        result = await _run_tool(entry["name"], entry["args"])
+    log.info(f"[TOOL RESULT] '{entry['name']}' → {result}")
+    await _tell_gemini(f"The user pressed Confirm on screen, so I already ran: {entry['summary']}. "
+                       f"Result: {result[:500]}. Do not call confirm_action for token {token}. Tell the user the outcome briefly.")
+
 
 _authenticator: VoiceAuthenticator | None = None
 
@@ -1079,7 +1148,7 @@ def _verify_owner_voice() -> bool:
     """Blocking: loads the SpeechBrain model once, then records + verifies the speaker."""
     global _authenticator
     if _authenticator is None:
-        print("[AUTH] Loading speaker-verification model...")
+        log.info("[AUTH] Loading speaker-verification model...")
         _authenticator = VoiceAuthenticator()
     return _authenticator.listen_and_verify()
 
@@ -1087,7 +1156,7 @@ def _verify_owner_voice() -> bool:
 async def handler(websocket) -> None:
     global session_running, _live_task
     connected_clients.add(websocket)
-    print(f"[WS] Flutter connected: {websocket.remote_address}")
+    log.info(f"[WS] Flutter connected: {websocket.remote_address}")
 
     await websocket.send(json.dumps({
         "type":    "status",
@@ -1100,7 +1169,7 @@ async def handler(websocket) -> None:
             try:
                 payload = json.loads(raw)
             except (json.JSONDecodeError, TypeError):
-                print(f"[WS] Ignoring malformed message: {str(raw)[:80]}")
+                log.warning(f"[WS] Ignoring malformed message: {str(raw)[:80]}")
                 continue
             cmd = payload.get("command") if isinstance(payload, dict) else None
 
@@ -1123,7 +1192,7 @@ async def handler(websocket) -> None:
                     try:
                         verified = await asyncio.to_thread(_verify_owner_voice)
                     except Exception as exc:
-                        print(f"[AUTH ERROR] {exc}")
+                        log.error(f"[AUTH ERROR] {exc}")
                         verified = False
                     if not verified:
                         session_running = False
@@ -1141,17 +1210,15 @@ async def handler(websocket) -> None:
                 _live_task = asyncio.create_task(run_gemini_live())
                 _live_task.add_done_callback(
                     lambda t: (
-                        print(f"[TASK ERROR] run_gemini_live: {t.exception()}")
+                        log.error(f"[TASK ERROR] run_gemini_live: {t.exception()}")
                         if not t.cancelled() and t.exception()
                         else None
                     )
                 )
 
-            elif cmd == "confirm":
-                # Trusted on-screen approval from the HUD (origin-checked socket)
-                token = gate.approve_latest_from_ui()
-                msg = "Action approved from HUD." if token else "Nothing is waiting for confirmation."
-                await broadcast("status", {"state": "processing", "message": msg})
+            elif cmd in ("confirm", "cancel"):
+                # Trusted on-screen Confirm / Cancel buttons (origin-checked socket)
+                await _resolve_from_hud(approved=(cmd == "confirm"))
 
             elif cmd == "stop":
                 session_running = False
@@ -1166,10 +1233,10 @@ async def handler(websocket) -> None:
     except (websockets.ConnectionClosed, websockets.exceptions.InvalidMessage, EOFError):
         pass
     except Exception as exc:
-        print(f"[WS ERROR] {exc}")
+        log.error(f"[WS ERROR] {exc}")
     finally:
         connected_clients.discard(websocket)
-        print("[WS] Client connection closed.")
+        log.info("[WS] Client connection closed.")
 
 
 # ============================================================
@@ -1177,6 +1244,7 @@ async def handler(websocket) -> None:
 # ============================================================
 
 async def main() -> None:
+    setup_logging()
     asyncio.create_task(telemetry_loop())
     # Browsers always send an Origin header; the Flutter desktop HUD sends none.
     # Rejecting foreign origins stops any website you visit from connecting to
@@ -1184,12 +1252,11 @@ async def main() -> None:
     allowed_origins = [None, re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")]
     async with websockets.serve(handler, "localhost", 8765, ping_interval=None,
                                 origins=allowed_origins):
-        print()
-        print("=" * 60)
-        print("  J.A.R.V.I.S CORE DAEMON — RUNNING")
-        print("  WebSocket: ws://localhost:8765")
-        print("=" * 60)
-        print()
+        log.info("=" * 56)
+        log.info("  J.A.R.V.I.S CORE DAEMON — RUNNING on ws://localhost:8765")
+        log.info(f"  Live models: {', '.join(LIVE_MODELS)}")
+        log.info(f"  Logs: logs/jarvis.log  (set JARVIS_LOG_LEVEL=DEBUG for packet-level detail)")
+        log.info("=" * 56)
         await asyncio.Future()
 
 

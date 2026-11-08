@@ -52,7 +52,7 @@ class TestServerConfirmationFlow(unittest.TestCase):
 
     def test_blocked_path_skips_confirmation_and_is_refused(self):
         # A path outside the sandbox is refused by the tool itself (real function)
-        with patch.dict(js.tools_map, {"write_local_file": js.write_local_file}):
+        with patch.dict(js.tools_map, {"write_local_file": js.TOOLS["write_local_file"].fn}):
             res = self.run_tool("write_local_file", {"filepath": r"C:\Windows\x.py", "new_content": "x"})
         self.assertIn("outside", res)
 

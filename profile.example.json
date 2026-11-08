@@ -18,5 +18,11 @@
       "city": "City",
       "province": "Province"
     }
+  },
+  "roll_no": "00XX000",
+  "department": "Your Department, University",
+  "mis": {
+    "department": "Department name as shown in the MIS dropdown",
+    "class": "Part of your class label in the MIS dropdown, e.g. Semester 8"
   }
 }

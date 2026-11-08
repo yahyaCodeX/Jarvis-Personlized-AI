@@ -26,12 +26,10 @@ pyautogui>=0.9.54
 pyperclip>=1.8.2
 
 # ── Browser automation ────────────────────────────────────────────
-playwright>=1.40            # assistive web navigation & checkout
+playwright>=1.40            # assistive web navigation, checkout, MIS attendance
 playwright-stealth>=2.0
 beautifulsoup4>=4.12        # DuckDuckGo result parsing
 pywhatkit>=5.4              # direct YouTube playback
-selenium>=4.10              # MUET MIS attendance login
-webdriver-manager>=4.0
 
 # ── Documents ─────────────────────────────────────────────────────
 python-docx>=0.8.11         # assignment generator

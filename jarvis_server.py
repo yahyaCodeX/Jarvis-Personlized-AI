@@ -30,48 +30,20 @@ logging.getLogger("websockets.protocol").setLevel(logging.CRITICAL)
 from google import genai
 from google.genai import types
 
+from audio_gate import BargeInGate
 from auth.voice_auth import VoiceAuthenticator
-from commands import (
-    fetch_ug_attendance,
-    youtube_control,
-    assistive_web_action,
-    assistive_checkout,
-    analyze_active_screen,
-    debug_active_screen_code,
-    read_local_file,
-    write_local_file,
-    find_local_file,
-    create_folder,
-    open_local_folder,
-    open_application,
-    close_application,
-    system_control,
-    generate_assignment,
-    ask_local_qwen,
-    open_website,
-    play_on_youtube,
-    search_google,
-    search_maps,
-    remember_fact,
-    get_all_memories,
-    browser_tab_control,
-    page_scroll,
-    site_interaction,
-)
+import tools
+from tools import TOOLS, clean_args, get_all_memories
+from tools.browser import ADDRESS_CHOICES as _ADDRESS_CHOICES
 from config import load_profile, get_secret, LIVE_MODELS, setup_logging
-from safety import gate, confirmation_required, check_path
+from safety import gate, confirmation_required
 import re
 
 log = logging.getLogger("jarvis.server")
 
 load_dotenv()
 
-# Personal data comes from profile.json (gitignored) — never hardcode it here.
 PROFILE = load_profile()
-_ADDRESS_CHOICES = ", ".join(
-    f"'{key}' ({addr.get('city', key)})"
-    for key, addr in (PROFILE.get("addresses") or {}).items()
-) or "'home'"
 
 # ============================================================
 #  Audio constants
@@ -86,32 +58,8 @@ MIC_DEVICE_INDEX   = 1            # Microphone Array (3- Realtek(R)) — fallbac
 # ============================================================
 #  Global state
 # ============================================================
-tools_map = {
-    "check_attendance":        fetch_ug_attendance,
-    "youtube_control":         youtube_control,
-    "assistive_web_action":    assistive_web_action,
-    "assistive_checkout":      assistive_checkout,
-    "analyze_active_screen":   analyze_active_screen,
-    "debug_active_screen_code": debug_active_screen_code,
-    "read_local_file":         read_local_file,
-    "write_local_file":        write_local_file,
-    "find_local_file":         find_local_file,
-    "create_folder":           create_folder,
-    "open_local_folder":       open_local_folder,
-    "open_application":        open_application,
-    "close_application":       close_application,
-    "system_control":          system_control,
-    "generate_assignment":     generate_assignment,
-    "ask_local_qwen":          ask_local_qwen,
-    "open_website":            open_website,
-    "play_on_youtube":         play_on_youtube,
-    "search_google":           search_google,
-    "search_maps":             search_maps,
-    "remember_fact":           remember_fact,
-    "browser_tab_control":     browser_tab_control,
-    "page_scroll":             page_scroll,
-    "site_interaction":        site_interaction,
-}
+# Every @tool in the tools/ package (name -> function). Declarations are generated from it.
+tools_map = {name: t.fn for name, t in TOOLS.items()}
 
 connected_clients:  set            = set()
 session_running:    bool           = False
@@ -182,37 +130,8 @@ def _run_tool_in_clean_thread(fn, *args, **kwargs):
 #  Sensitive tools — require the user's spoken "confirm"
 # ============================================================
 
-def _summarize_write(args: dict) -> str | None:
-    ok, resolved = check_path(args.get("filepath", ""))
-    if not ok:
-        return None  # blocked path — let the tool itself return the refusal
-    new_lines = (args.get("new_content") or "").count("\n") + 1
-    if os.path.isfile(resolved):
-        try:
-            with open(resolved, "r", encoding="utf-8", errors="replace") as f:
-                old_lines = f.read().count("\n") + 1
-        except Exception:
-            old_lines = "?"
-        return f"overwrite {os.path.basename(resolved)} ({old_lines} lines now, {new_lines} lines after) in {os.path.dirname(resolved)}"
-    return f"create a new file {resolved} with {new_lines} lines"
-
-
-def _summarize_close(args: dict) -> str:
-    return f"force-close {args.get('app_name', 'an application')} (unsaved work will be lost)"
-
-
-def _summarize_checkout(args: dict) -> str:
-    choice = args.get("address_choice", "home")
-    phone = (args.get("custom_phone") or PROFILE.get("default_phone") or "").strip()
-    tail = f" and phone ending in {phone[-4:]}" if len(phone) >= 4 else ""
-    return f"fill this checkout page with your {choice} address{tail}"
-
-
-SENSITIVE_TOOLS = {
-    "write_local_file":   _summarize_write,
-    "close_application":  _summarize_close,
-    "assistive_checkout": _summarize_checkout,
-}
+# Tools marked @tool(confirm=...) need the user's spoken "confirm" (fn(args) -> summary)
+SENSITIVE_TOOLS = {name: t.confirm for name, t in TOOLS.items() if t.confirm}
 
 # Tools that may legitimately be called several times in a row
 _NO_DEBOUNCE = {"confirm_action"}
@@ -223,7 +142,7 @@ async def _run_tool(name: str, args: dict) -> str:
     if fn is None:
         return f"Tool '{name}' not recognised."
     try:
-        return str(await asyncio.to_thread(_run_tool_in_clean_thread, fn, **args))
+        return str(await asyncio.to_thread(_run_tool_in_clean_thread, fn, **clean_args(fn, args)))
     except Exception as exc:
         log.error(f"[TOOL ERROR] {name}: {exc}")
         return f"Error in {name}: {exc}"
@@ -366,6 +285,9 @@ def _mic_capture_thread(
 
     frame_n    = 0
     last_log   = time.time()
+    barge      = BargeInGate()
+    barge_seen = 0
+    log.info("[MIC THREAD] Barge-in " + ("on" if barge.enabled else "off (JARVIS_BARGE_IN=0)") + ".")
 
     try:
         while not stop_event.is_set():
@@ -393,12 +315,18 @@ def _mic_capture_thread(
             if len(pcm) < 256:
                 time.sleep(0.005)
 
-            # ── Skip sending while Jarvis is outputting speech ───────────────
-            if is_jarvis_speaking:
-                continue
+            # ── While Jarvis talks, only the user's own voice gets through ───
+            # (barge-in: louder than Jarvis's echo → forwarded so Gemini stops
+            # talking). Off while an action waits for "confirm" so Jarvis's
+            # echo can never count as the user's answer.
+            chunks = barge.process(pcm, is_jarvis_speaking, allow=not gate.has_pending())
+            if barge.triggered_count != barge_seen:
+                barge_seen = barge.triggered_count
+                log.info(f"[BARGE-IN] User spoke over Jarvis (threshold {barge.threshold():.3f}) — forwarding mic.")
 
-            # ── Hand chunk to the async world — zero event-loop blocking ─────
-            loop.call_soon_threadsafe(mic_queue.put_nowait, pcm)
+            # ── Hand chunks to the async world — zero event-loop blocking ────
+            for chunk in chunks:
+                loop.call_soon_threadsafe(mic_queue.put_nowait, chunk)
 
     except Exception as exc:
         log.exception(f"[MIC THREAD CRASH] {exc}")  # includes the traceback
@@ -421,6 +349,20 @@ def _load_personality() -> str:
             return f.read().strip()
     except OSError:
         return "You are Jarvis, a concise, witty personal AI assistant. Keep spoken replies short."
+
+
+# Server-side tool (not in tools/): completes a sensitive action after the user's spoken "confirm"
+CONFIRM_ACTION_DECLARATION = {
+    "name": "confirm_action",
+    "description": "Completes a sensitive action after a tool replied 'CONFIRMATION REQUIRED'. Call ONLY after the "
+                   "user has answered out loud. The server checks the user's real voice transcript, so it will "
+                   "refuse if the user did not say confirm.",
+    "parameters": {
+        "type": "OBJECT",
+        "properties": {"token": {"type": "STRING", "description": "The token from the CONFIRMATION REQUIRED message."}},
+        "required": ["token"],
+    },
+}
 
 
 def build_live_config() -> types.LiveConnectConfig:
@@ -481,249 +423,7 @@ def build_live_config() -> types.LiveConnectConfig:
         system_instruction=types.Content(
             parts=[types.Part.from_text(text=system_prompt)]
         ),
-        tools=[{
-            "function_declarations": [
-                {
-                    "name": "youtube_control",
-                    "description": "Manages YouTube: 'search' (opens YouTube search results), 'select_video' (selects video 1, 2, 3, etc. from search results via Tab/Enter), or 'play_direct' (plays directly via pywhatkit). Use 'search' when the user wants to search/browse, and 'select_video' when user asks to click/open a specific video rank.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "action":      {"type": "STRING", "description": "'search', 'select_video', or 'play_direct'"},
-                            "query":       {"type": "STRING", "description": "Search query or video title"},
-                            "video_index": {"type": "INTEGER", "description": "1-based video index when action is 'select_video'"},
-                        },
-                        "required": ["action"],
-                    },
-                },
-                {
-                    "name": "assistive_web_action",
-                    "description": "Universal Smart Navigation Tool. Actions: 'search' (DuckDuckGo search), 'open_url' (open URL or brand name), 'click_result' (click 1st/2nd/3rd SEARCH ENGINE result — NOT for product grids), 'click_text' (click any visible element by its exact displayed text — USE THIS for e-commerce products, buttons, links on any page), 'play_youtube' (search and play video), 'new_tab', 'close_tab', 'switch_tab', 'scroll_down', 'scroll_up'.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "action": {"type": "STRING", "description": "'search', 'open_url', 'click_result', 'click_text', 'play_youtube', 'new_tab', 'close_tab', 'switch_tab', 'scroll_down', or 'scroll_up'"},
-                            "target": {"type": "STRING", "description": "Search query, URL, result rank (1/2/3), exact product/button text to click, or YouTube query"},
-                        },
-                        "required": ["action"],
-                    },
-                },
-                {
-                    "name": "assistive_checkout",
-                    "description": f"Injects the user's saved shipping & checkout details into the currently open browser page after the user verbally confirms the address choice ({_ADDRESS_CHOICES}) and contact phone number.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "address_choice": {"type": "STRING", "description": f"Saved address key: {_ADDRESS_CHOICES}"},
-                            "custom_phone":   {"type": "STRING", "description": "Optional phone number if different from the user's saved default"},
-                        },
-                        "required": ["address_choice"],
-                    },
-                },
-                {
-                    "name": "analyze_active_screen",
-                    "description": "Screen Vision Tool for SDG 10 visually impaired accessibility. Captures active screen and inspects product prices, details, or text displayed on screen.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "query": {"type": "STRING", "description": "Item or product name to find on screen"},
-                        },
-                    },
-                },
-                {
-                    "name": "debug_active_screen_code",
-                    "description": "Ghost Coder: takes a high-quality screenshot of the user's active IDE, terminal, or browser and uses Gemini Vision to identify programming errors, bugs, crashes, missing imports, or wrong annotations — then explains the exact fix. Call this when the user asks to debug their code, look at their screen, or figure out why their app is crashing.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "issue_hint": {"type": "STRING", "description": "Optional hint from the user about what is crashing or what they are trying to fix (e.g. 'NullPointerException', 'app won\'t start')."},
-                        },
-                    },
-                },
-                {
-                    "name": "create_folder",
-                    "description": "Creates a directory on Desktop, Downloads, Documents, Projects (D:\\Development), or a custom directory path.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "folder_name": {"type": "STRING", "description": "Name of the folder to create"},
-                            "location":    {"type": "STRING", "description": "'Desktop', 'Downloads', 'Documents', 'Projects', or absolute path"},
-                        },
-                        "required": ["folder_name"],
-                    },
-                },
-                {
-                    "name": "play_on_youtube",
-                    "description": "Searches for and plays any song, music, or video on YouTube.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {"query": {"type": "STRING"}},
-                        "required": ["query"],
-                    },
-                },
-                {
-                    "name": "open_local_folder",
-                    "description": "Opens a local folder in Windows File Explorer. Navigates an existing Explorer window if one is already open, or opens a new one. Use for Desktop, Downloads, Documents, D:\\Development, or any absolute path.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "target_path": {"type": "STRING", "description": "Absolute path or common location like Desktop, Downloads, Documents"},
-                        },
-                        "required": ["target_path"],
-                    },
-                },
-                {
-                    "name": "search_google",
-                    "description": "Performs a Google search for any topic.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {"query": {"type": "STRING"}},
-                        "required": ["query"],
-                    },
-                },
-                {
-                    "name": "check_attendance",
-                    "description": "Loads MIS university attendance.",
-                    "parameters": {"type": "OBJECT", "properties": {}},
-                },
-                {
-                    "name": "open_application",
-                    "description": "Opens an application by name.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {"app_name": {"type": "STRING"}},
-                        "required": ["app_name"],
-                    },
-                },
-                {
-                    "name": "close_application",
-                    "description": "Safely closes a running application.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {"app_name": {"type": "STRING"}},
-                        "required": ["app_name"],
-                    },
-                },
-                {
-                    "name": "system_control",
-                    "description": "Controls system parameters: volume, brightness, lock.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {"action": {"type": "STRING"}},
-                        "required": ["action"],
-                    },
-                },
-                {
-                    "name": "open_website",
-                    "description": "Opens a website URL or search in the browser.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {"url_or_query": {"type": "STRING"}},
-                        "required": ["url_or_query"],
-                    },
-                },
-                {
-                    "name": "browser_tab_control",
-                    "description": "Manages browser tabs: next_tab, prev_tab, close_tab, select_tab.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "action":    {"type": "STRING"},
-                            "tab_index": {"type": "INTEGER"},
-                        },
-                        "required": ["action"],
-                    },
-                },
-                {
-                    "name": "page_scroll",
-                    "description": "Scrolls the active browser page or window up or down.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "direction": {"type": "STRING"},
-                            "amount":    {"type": "INTEGER"},
-                        },
-                        "required": ["direction"],
-                    },
-                },
-                {
-                    "name": "site_interaction",
-                    "description": "Interacts with webpage elements: youtube_search, youtube_select_video, page_search.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "action": {"type": "STRING"},
-                            "query":  {"type": "STRING"},
-                        },
-                        "required": ["action"],
-                    },
-                },
-                {
-                    "name": "search_maps",
-                    "description": "Launches Google Maps for a location or place search.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {"query": {"type": "STRING"}},
-                        "required": ["query"],
-                    },
-                },
-                {
-                    "name": "remember_fact",
-                    "description": "Saves a fact or preference permanently to long-term memory.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {"fact": {"type": "STRING"}},
-                        "required": ["fact"],
-                    },
-                },
-                {
-                    "name": "confirm_action",
-                    "description": "Completes a sensitive action after a tool replied 'CONFIRMATION REQUIRED'. Call ONLY after the user has answered out loud. The server checks the user's real voice transcript, so it will refuse if the user did not say confirm.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "token": {"type": "STRING", "description": "The token from the CONFIRMATION REQUIRED message."},
-                        },
-                        "required": ["token"],
-                    },
-                },
-                {
-                    "name": "read_local_file",
-                    "description": "Reads the full text or source code of any local file on the user's computer. Use this to analyze codebases, review configs, or inspect logs before making changes.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "filepath": {"type": "STRING", "description": "Absolute or relative path to the file to read (e.g. 'D:/Development/My-Personal-AI/commands.py')."},
-                        },
-                        "required": ["filepath"],
-                    },
-                },
-                {
-                    "name": "write_local_file",
-                    "description": "Overwrites a local file with completely new code or content. Use this to autonomously fix bugs and save the corrected file directly to the user's machine. ALWAYS write the ENTIRE file — never partial snippets.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "filepath":    {"type": "STRING", "description": "Absolute or relative path to the file to write."},
-                            "new_content": {"type": "STRING", "description": "The complete, fully corrected code/content to write to the file."},
-                        },
-                        "required": ["filepath", "new_content"],
-                    },
-                },
-                {
-                    "name": "find_local_file",
-                    "description": "Recursively searches the local file system for a file by name or partial name. ALWAYS call this before `read_local_file` or `write_local_file` if you do not know the exact absolute path. Never guess file paths.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "filename": {"type": "STRING", "description": "The file name or partial name to search for (e.g. 'commands.py', 'MainActivity')."},
-                            "root_dir": {"type": "STRING", "description": "Directory to start searching from. Defaults to current directory. Use 'D:/Development' for the user's main projects folder."},
-                        },
-                        "required": ["filename"],
-                    },
-                },
-            ]
-        }],
+        tools=[{"function_declarations": tools.declarations() + [CONFIRM_ACTION_DECLARATION]}],
     )
     return config
 
@@ -1181,7 +881,7 @@ async def handler(websocket) -> None:
                 session_running = True
                 await broadcast("status", {
                     "state":   "face_scanning",
-                    "user":    "TAB & TECH",
+                    "user":    (PROFILE.get("name") or "OWNER").upper(),
                     "message": "Initializing J.A.R.V.I.S OS...",
                 })
 
@@ -1203,7 +903,7 @@ async def handler(websocket) -> None:
                 # (No SAPI greeting here — Gemini speaks the greeting once connected.)
                 await broadcast("status", {
                     "state":   "listening",
-                    "user":    "TAB & TECH",
+                    "user":    (PROFILE.get("name") or "OWNER").upper(),
                     "message": "Launching Gemini Live Duplex...",
                 })
 
@@ -1255,7 +955,7 @@ async def main() -> None:
         log.info("=" * 56)
         log.info("  J.A.R.V.I.S CORE DAEMON — RUNNING on ws://localhost:8765")
         log.info(f"  Live models: {', '.join(LIVE_MODELS)}")
-        log.info(f"  Logs: logs/jarvis.log  (set JARVIS_LOG_LEVEL=DEBUG for packet-level detail)")
+        log.info("  Logs: logs/jarvis.log  (set JARVIS_LOG_LEVEL=DEBUG for packet-level detail)")
         log.info("=" * 56)
         await asyncio.Future()
 

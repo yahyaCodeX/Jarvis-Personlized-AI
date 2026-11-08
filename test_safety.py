@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import safety
-import commands
+from tools import apps, files, _shared
 
 
 class TestPathSandbox(unittest.TestCase):
@@ -44,17 +44,17 @@ class TestPathSandbox(unittest.TestCase):
         target = os.path.join(self.root, "code.py")
         with open(target, "w", encoding="utf-8") as f:
             f.write("old\n")
-        res = commands.write_local_file(target, "new\n")
+        res = files.write_local_file(target, "new\n")
         self.assertIn("Successfully", res)
         with open(target + ".bak", encoding="utf-8") as f:
             self.assertEqual(f.read(), "old\n")
 
-        res = commands.write_local_file(r"C:\Windows\evil.py", "x")
+        res = files.write_local_file(r"C:\Windows\evil.py", "x")
         self.assertIn("outside", res)
         self.assertFalse(os.path.exists(r"C:\Windows\evil.py"))
 
     def test_read_local_file_blocks_env(self):
-        res = commands.read_local_file(os.path.join(self.root, ".env"))
+        res = files.read_local_file(os.path.join(self.root, ".env"))
         self.assertIn("blocked", res)
 
 
@@ -108,6 +108,14 @@ class TestConfirmationGate(unittest.TestCase):
         self.assertEqual(self.gate.pop_latest()[1]["summary"], "older")
         self.assertIsNone(self.gate.pop_latest())
 
+    def test_has_pending_tracks_open_requests(self):
+        self.assertFalse(self.gate.has_pending())
+        tok = self.gate.request("write_local_file", {}, "overwrite x")
+        self.assertTrue(self.gate.has_pending())
+        self.gate.record_user_speech("cancel")
+        self.gate.resolve(tok)
+        self.assertFalse(self.gate.has_pending())
+
     def test_expired_request(self):
         tok = self.gate.request("write_local_file", {}, "overwrite x")
         self.gate._pending[tok]["created"] -= safety.CONFIRM_TIMEOUT_S + 1
@@ -117,46 +125,46 @@ class TestConfirmationGate(unittest.TestCase):
 
 class TestShellInjection(unittest.TestCase):
 
-    @patch("commands.subprocess.run")
+    @patch("tools.apps.subprocess.run")
     def test_close_application_rejects_metacharacters(self, mock_run):
-        res = commands.close_application("chrome & del C:\\important")
+        res = apps.close_application("chrome & del C:\\important")
         self.assertIn("valid application name", res)
         mock_run.assert_not_called()
 
-    @patch("commands.subprocess.run")
+    @patch("tools.apps.subprocess.run")
     def test_close_application_uses_arg_list(self, mock_run):
         mock_run.return_value.returncode = 0
-        commands.close_application("notepad")
+        apps.close_application("notepad")
         args, kwargs = mock_run.call_args
         self.assertEqual(args[0], ["taskkill", "/f", "/im", "notepad.exe"])
         self.assertNotIn("shell", kwargs)
 
     def test_close_application_protects_jarvis_itself(self):
-        self.assertIn("blocked", commands.close_application("python"))
+        self.assertIn("blocked", apps.close_application("python"))
 
-    @patch("commands.os.system")
-    @patch("commands.subprocess.Popen")
-    @patch("commands.os.startfile")
+    @patch("tools.apps.os.system")
+    @patch("tools.apps.subprocess.Popen")
+    @patch("tools.apps.os.startfile")
     def test_open_application_rejects_injection(self, mock_startfile, mock_popen, mock_system):
-        res = commands.open_application('foo" & evil.exe & "')
+        res = apps.open_application('foo" & evil.exe & "')
         self.assertIn("couldn't find", res)
         mock_popen.assert_not_called()
         mock_system.assert_not_called()
 
-    @patch("commands.os.startfile")
+    @patch("tools.apps.os.startfile")
     def test_open_application_refuses_scripts(self, mock_startfile):
         with tempfile.NamedTemporaryFile(suffix=".bat", delete=False) as f:
             path = f.name
         try:
-            res = commands.open_application(path)
+            res = apps.open_application(path)
             self.assertIn("won't run script", res)
             mock_startfile.assert_not_called()
         finally:
             os.remove(path)
 
-    @patch("commands.os.startfile")
+    @patch("tools._shared.os.startfile")
     def test_force_open_browser_rejects_non_http(self, mock_startfile):
-        self.assertFalse(commands.force_open_browser('" & calc & "'))
+        self.assertFalse(_shared.force_open_browser('" & calc & "'))
         mock_startfile.assert_not_called()
 
 

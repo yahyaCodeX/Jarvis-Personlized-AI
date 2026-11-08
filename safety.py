@@ -138,6 +138,12 @@ class ConfirmationGate:
             self._expire()
             return (token or "").strip() in self._pending
 
+    def has_pending(self) -> bool:
+        """True while any sensitive action is waiting for the user's answer."""
+        with self._lock:
+            self._expire()
+            return bool(self._pending)
+
     # ── Tool-side API ────────────────────────────────────────────────────────
     def request(self, name: str, args: dict, summary: str) -> str:
         token = secrets.token_hex(3)

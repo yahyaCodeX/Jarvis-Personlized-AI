@@ -20,6 +20,18 @@
 - 🌐 **Browser Automation:** Selenium integration for automatic web tasks (e.g., MUET attendance login).
 - 📝 **Academic Tools:** Generates Word documents automatically for academic assignments using `python-docx`.
 
+## 🔐 Security Model
+
+Jarvis can see your screen, browse the web and edit files, so text on a web page could try to give it instructions (prompt injection). These protections are on by default:
+
+- **Voice biometrics:** a session only starts after your voice matches `auth/owner_voice.wav` (run `python enroll_voice.py` first). Errors deny access.
+- **Spoken confirmation:** writing files, force-closing apps and filling checkout forms need you to say **"confirm"**. The server checks your real microphone transcript, so the AI can't approve its own actions.
+- **Folder sandbox:** file tools only work inside `JARVIS_ALLOWED_DIRS`. `.env`, `profile.json`, `.git` and your voiceprint are always blocked. Every overwrite keeps a `.bak` copy.
+- **No shell injection:** apps are launched and closed with validated names, without passing text through `cmd.exe`.
+- **Local-only socket:** websites you visit can't connect to `ws://localhost:8765`.
+
+Settings live in `.env` (see `.env.example`).
+
 ## 🛠️ Tech Stack
 
 - **Core:** Python, Requests

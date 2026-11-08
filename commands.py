@@ -45,6 +45,10 @@ last_opened_folder = None
 # ─── Config ──────────────────────────────────────────────────
 # Secrets come from .env, personal data from profile.json (both gitignored).
 from config import get_secret, load_profile
+from safety import check_path, allowed_dirs
+import shutil
+
+MAX_READ_BYTES = 200 * 1024  # don't stream huge files into the voice model
 
 USER_PROFILES = load_profile()
 WEATHER_CITY = USER_PROFILES.get("weather_city") or "Jamshoro, Sindh"
@@ -320,8 +324,12 @@ def focus_browser_and_page():
 def force_open_browser(url: str) -> bool:
     """Forces opening a URL on Windows using multiple robust fallback methods."""
     opened = False
+    # Only real web URLs — never hand arbitrary text to the shell
+    if not re.match(r"^https?://", url or "", re.IGNORECASE):
+        print(f"[BROWSER] Refusing non-http URL: {url!r}")
+        return False
     try:
-        subprocess.Popen(f'start "" "{url}"', shell=True)
+        os.startfile(url)  # opens in the default browser, no shell involved
         opened = True
     except Exception:
         pass
@@ -1432,7 +1440,13 @@ def read_local_file(filepath: str) -> str:
     Returns the raw content prefixed with the resolved absolute path.
     Handles large files gracefully — no size limit imposed by Jarvis.
     """
-    filepath = os.path.abspath(filepath)
+    ok, resolved = check_path(filepath)
+    if not ok:
+        print(f"[FILE I/O BLOCKED] read {filepath}: {resolved}")
+        return resolved
+    filepath = resolved
+    if os.path.isfile(filepath) and os.path.getsize(filepath) > MAX_READ_BYTES:
+        return f"File is too large to read aloud ({os.path.getsize(filepath) // 1024} KB, limit {MAX_READ_BYTES // 1024} KB)."
     print(f"[FILE I/O] Reading: {filepath}")
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
@@ -1460,10 +1474,17 @@ def write_local_file(filepath: str, new_content: str) -> str:
     Creates parent directories if they do not exist.
     Always writes the ENTIRE file — never partial snippets.
     """
-    filepath = os.path.abspath(filepath)
+    ok, resolved = check_path(filepath)
+    if not ok:
+        print(f"[FILE I/O BLOCKED] write {filepath}: {resolved}")
+        return resolved
+    filepath = resolved
     print(f"[FILE I/O] Writing: {filepath}")
     try:
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        # Keep the previous version so any AI edit can be undone
+        if os.path.isfile(filepath):
+            shutil.copy2(filepath, filepath + ".bak")
         # Atomic-safe write: write to a temp file first, then replace
         tmp_path = filepath + ".jarvis_tmp"
         with open(tmp_path, 'w', encoding='utf-8') as f:
@@ -1471,7 +1492,8 @@ def write_local_file(filepath: str, new_content: str) -> str:
         os.replace(tmp_path, filepath)
         lines = new_content.count('\n') + 1
         print(f"[FILE I/O] Successfully wrote {lines} lines to {filepath}.")
-        return f"Successfully updated and saved {lines} lines of code to {filepath}."
+        backup_note = f" Previous version saved as {os.path.basename(filepath)}.bak." if os.path.isfile(filepath + ".bak") else ""
+        return f"Successfully updated and saved {lines} lines of code to {filepath}.{backup_note}"
     except Exception as e:
         # Clean up temp file if it exists
         try:
@@ -1483,21 +1505,29 @@ def write_local_file(filepath: str, new_content: str) -> str:
 
 
 def find_local_file(filename: str, root_dir: str = None) -> str:
-    import os
     matches = []
     target = filename.lower()
-    
-    # Start in the project folder, fallback to the entire User directory (C:\Users\...)
-    search_dirs = [os.getcwd()] if root_dir is None else [root_dir]
-    if root_dir is None:
-        search_dirs.append(os.path.expanduser("~"))
 
+    # Only search inside folders Jarvis is allowed to access
+    if root_dir:
+        ok, resolved = check_path(root_dir)
+        if not ok:
+            return resolved
+        search_dirs = [resolved]
+    else:
+        search_dirs = [os.getcwd()] + allowed_dirs()
+
+    skip_dirs = {".git", "node_modules", "__pycache__", ".venv", "venv", "build", ".dart_tool"}
     try:
         for search_dir in search_dirs:
-            for root, _, files in os.walk(search_dir):
+            for root, dirs, files in os.walk(search_dir):
+                dirs[:] = [d for d in dirs if d not in skip_dirs]
                 for file in files:
-                    if target in file.lower():
-                        matches.append(os.path.abspath(os.path.join(root, file)))
+                    full = os.path.abspath(os.path.join(root, file))
+                    if target in file.lower() and check_path(full)[0]:
+                        matches.append(full)
+                if len(matches) >= 25:
+                    break
             
             # If found in the first directory (project), stop searching to save time
             if matches:
@@ -1722,7 +1752,9 @@ def open_application(app_name: str) -> str:
         last_opened_folder = os.path.abspath(path_clean)
     
     # Check if it's a URL
-    if name_clean.startswith("http://") or name_clean.startswith("https://") or re.match(r'^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}', name_clean):
+    looks_like_domain = (re.match(r'^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}', name_clean)
+                         and not re.search(r'\.(exe|bat|cmd|lnk|msc|txt|pdf|docx?|py)$', name_clean))
+    if name_clean.startswith("http://") or name_clean.startswith("https://") or looks_like_domain:
         url = name_clean if name_clean.startswith("http") else f"https://{name_clean}"
         webbrowser.open(url)
         return f"Opening URL: {url}, sir."
@@ -1739,16 +1771,50 @@ def open_application(app_name: str) -> str:
             except Exception as e:
                 return f"Failed to open {app_key}: {e}"
                 
-    # Fallback to direct start
-    try:
-        os.startfile(path_clean)
-        return f"Opening {path_clean}, sir."
-    except Exception:
+    # Fallback 1: an existing folder or file path
+    if os.path.exists(path_clean):
+        ext = os.path.splitext(path_clean)[1].lower()
+        if ext in _SCRIPT_EXTS:
+            return f"For safety I won't run script files ({ext}) by voice, sir. Open it manually."
+        if ext == ".exe" and not _is_trusted_exe_location(path_clean):
+            return "For safety I only launch programs installed in Program Files or Windows, sir."
         try:
-            subprocess.Popen([path_clean], shell=True)
+            os.startfile(path_clean)
+            return f"Opening {path_clean}, sir."
+        except Exception as e:
+            return f"Could not open '{path_clean}': {e}"
+
+    # Fallback 2: a plain installed-app name (e.g. "spotify", "obs64").
+    # Strict character whitelist so nothing can be smuggled into cmd.exe.
+    if re.fullmatch(r"[A-Za-z0-9 ._-]{1,60}", path_clean):
+        try:
+            subprocess.Popen(["cmd", "/c", "start", "", path_clean])
             return f"Launching {path_clean}, sir."
         except Exception as e2:
             return f"Could not launch or find application '{app_name}': {e2}"
+    return f"I couldn't find an application called '{app_name}', sir."
+
+
+_SCRIPT_EXTS = {".bat", ".cmd", ".ps1", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh",
+                ".hta", ".scr", ".msi", ".com", ".pif", ".reg", ".lnk"}
+
+
+def _is_trusted_exe_location(path: str) -> bool:
+    real = os.path.normcase(os.path.realpath(path))
+    trusted = [
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        os.environ.get("SystemRoot", r"C:\Windows"),
+        os.path.join(os.path.expanduser("~"), "AppData", "Local", "Programs"),
+    ]
+    for root in trusted:
+        root = os.path.normcase(os.path.realpath(root))
+        try:
+            if os.path.commonpath([real, root]) == root:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def close_application(app_name: str) -> str:
@@ -1756,7 +1822,9 @@ def close_application(app_name: str) -> str:
     name_clean = app_name.lower().strip()
     
     # Strict blocklist to protect critical Windows system processes
-    blocklist = ['explorer.exe', 'csrss.exe', 'svchost.exe', 'winlogon.exe']
+    blocklist = ['explorer.exe', 'csrss.exe', 'svchost.exe', 'winlogon.exe', 'lsass.exe',
+                 'services.exe', 'smss.exe', 'wininit.exe', 'dwm.exe', 'msmpeng.exe',
+                 'python.exe', 'pythonw.exe', 'py.exe']  # python = Jarvis itself
     
     # Map common keys to process names
     app_mapping = {
@@ -1805,8 +1873,12 @@ def close_application(app_name: str) -> str:
         else:
             return f"[WARNING] Terminating critical system process '{exe_name}' is blocked to protect system stability, sir."
             
+    # Process names only: letters, digits, space, dot, dash, underscore — no shell metacharacters
+    if not re.fullmatch(r"[A-Za-z0-9 ._-]{1,64}\.exe", exe_name, re.IGNORECASE):
+        return f"'{app_name}' doesn't look like a valid application name, sir."
+
     try:
-        result = subprocess.run(f"taskkill /f /im {exe_name}", capture_output=True, text=True, shell=True)
+        result = subprocess.run(["taskkill", "/f", "/im", exe_name], capture_output=True, text=True)
         if result.returncode == 0:
             return f"Closed {app_name} successfully, sir."
         else:

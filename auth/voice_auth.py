@@ -99,8 +99,10 @@ class VoiceAuthenticator:
             baseline_path = os.path.join(os.path.dirname(__file__), "owner_voice.wav")
             
         if not os.path.exists(baseline_path):
-            print(f"\n[WARNING] Biometric baseline '{baseline_path}' not found. Voice verification bypassed (fail-safe active).")
-            return True
+            # Fail CLOSED: no voiceprint means we cannot know who is speaking.
+            print(f"\n[SECURITY] Biometric baseline '{baseline_path}' not found. "
+                  "Run `python enroll_voice.py` to enroll, or set JARVIS_VOICE_AUTH=0 in .env to disable.")
+            return False
             
         if not os.path.exists(test_audio_path):
             print(f"\n[ERROR] Test audio file '{test_audio_path}' not found for verification.")
@@ -111,9 +113,10 @@ class VoiceAuthenticator:
             print(f"\n[BIOMETRIC] Similarity Score: {score.item():.4f} (Threshold: {self.threshold:.2f})")
             return score.item() > self.threshold
         except Exception as e:
+            # Fail CLOSED: an error must never grant access. Retry, or set
+            # JARVIS_VOICE_AUTH=0 in .env if the model is broken on this machine.
             print(f"\n[ERROR] Speaker recognition failed: {e}")
-            # In case of internal processing error, fallback to True to avoid locking out the owner
-            return True
+            return False
 
     def listen_and_verify(self, max_attempts: int = 3) -> bool:
         """Records microphone audio and runs biometric verification.
